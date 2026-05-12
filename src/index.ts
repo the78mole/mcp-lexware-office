@@ -443,9 +443,9 @@ server.tool(
 
 server.tool(
 	'get-file',
-	'Download a file (PDF or XML) from Lexware Office by its file ID. File IDs are found in the \'files.documentFileId\' field of voucher or invoice details.',
+	'Download a file (PDF or XML) from Lexware Office by its file ID. Note: the files.documentFileId field is deprecated — prefer get-document-file when you have a document ID. Use this tool only when you have a raw file ID (e.g. from voucher file attachments).',
 	{
-		id: z.string().uuid().describe('The file ID from the files.documentFileId field in voucher or invoice details'),
+		id: z.string().uuid().describe('The file ID (not a document ID — use get-document-file for invoices/quotations/etc.)'),
 		format: z
 			.enum(['pdf', 'xml'])
 			.optional()
