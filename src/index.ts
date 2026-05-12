@@ -1402,6 +1402,37 @@ server.tool(
 );
 
 server.tool(
+	'get-down-payment-invoices',
+	'Get a list of down payment invoices (Anzahlungsrechnungen) from Lexware Office',
+	{
+		status: z
+			.array(z.enum(['draft', 'open', 'paid', 'voided']))
+			.optional()
+			.default(['draft', 'open', 'paid', 'voided']),
+		contactId: z.string().uuid().optional().describe('Filter by contact ID'),
+		page: z.number().min(0).optional().default(0).describe('page number to retrieve; starts at 0'),
+		size: z.number().min(1).max(250).optional().default(250).describe('number of results per page'),
+	},
+	async ({ status, contactId, page, size }) => {
+		let url = `/v1/voucherlist?voucherType=downpaymentinvoice&voucherStatus=${status.join(',')}&page=${page}&size=${size}`;
+		if (contactId) url += `&contactId=${contactId}`;
+		const data = await makeLexwareOfficeRequest<any>(url);
+		const vouchers = data?.content;
+
+		if (!vouchers || vouchers.length === 0) {
+			return { content: [{ type: 'text', text: 'No down payment invoices found' }] };
+		}
+
+		return {
+			content: [{
+				type: 'text',
+				text: `There are ${data.totalElements} down payment invoices in total (showing ${vouchers.length} on page ${page}):\n\n${JSON.stringify(vouchers, null, 2)}`,
+			}],
+		};
+	},
+);
+
+server.tool(
 	'get-down-payment-invoice-details',
 	'Get details of a down payment invoice (Anzahlungsrechnung) from Lexware Office by its ID',
 	{
