@@ -574,7 +574,7 @@ server.tool(
 
 server.tool(
 	'create-contact',
-	'Create a new contact in Lexware Office. Provide companyName for a company contact, or firstName/lastName for a person. Set customer and/or vendor to true.',
+	'Create a new contact in Lexware Office. For company contacts: provide companyName and optionally contactPersons (max. 1) with emailAddress. For person contacts: provide firstName/lastName. Supports billing/shipping address, email addresses (business/office/private/other), and phone numbers. Set customer and/or vendor to true. API limit: max. one entry per email/phone list, max. one contactPerson.',
 	{
 		customer: z.string().optional().transform(v => v === 'true').describe('Set to "true" to assign the customer role'),
 		vendor: z.string().optional().transform(v => v === 'true').describe('Set to "true" to assign the vendor role'),
@@ -585,19 +585,110 @@ server.tool(
 		lastName: z.string().optional().describe('Last name — for person contacts; required if companyName is not provided'),
 		salutation: z.string().optional().describe('Salutation for person contacts'),
 		note: z.string().optional(),
+		billingStreet: z.string().optional().describe('Street and house number of the billing address'),
+		billingZip: z.string().optional().describe('Postal code of the billing address'),
+		billingCity: z.string().optional().describe('City of the billing address'),
+		billingCountryCode: z.string().length(2).optional().describe('ISO 3166-1 alpha-2 country code, e.g. "DE"'),
+		billingSupplement: z.string().optional().describe('Optional address supplement (Adresszusatz)'),
+		shippingStreet: z.string().optional().describe('Street and house number of the shipping address'),
+		shippingZip: z.string().optional().describe('Postal code of the shipping address'),
+		shippingCity: z.string().optional().describe('City of the shipping address'),
+		shippingCountryCode: z.string().length(2).optional().describe('ISO 3166-1 alpha-2 country code, e.g. "DE"'),
+		shippingSupplement: z.string().optional().describe('Optional address supplement for shipping'),
+		emailBusiness: z.string().optional().describe('Business email address (max. 1 per type — API limit)'),
+		emailOffice: z.string().optional().describe('Office email address (max. 1 per type — API limit)'),
+		emailPrivate: z.string().optional().describe('Private email address (max. 1 per type — API limit)'),
+		emailOther: z.string().optional().describe('Other email address (max. 1 per type — API limit)'),
+		phoneBusiness: z.string().optional().describe('Business phone number (max. 1 per type — API limit)'),
+		phoneOffice: z.string().optional().describe('Office phone number (max. 1 per type — API limit)'),
+		phoneMobile: z.string().optional().describe('Mobile phone number (max. 1 per type — API limit)'),
+		phonePrivate: z.string().optional().describe('Private phone number (max. 1 per type — API limit)'),
+		phoneFax: z.string().optional().describe('Fax number (max. 1 per type — API limit)'),
+		phoneOther: z.string().optional().describe('Other phone number (max. 1 per type — API limit)'),
+		contactPersons: z
+			.array(
+				z.object({
+					salutation: z.string().optional(),
+					firstName: z.string().optional(),
+					lastName: z.string(),
+					primary: z.boolean().optional(),
+					emailAddress: z.string().optional(),
+					phoneNumber: z.string().optional(),
+				}),
+			)
+			.optional()
+			.describe('Contact persons for company contacts. Max. 1 entry (API limit).'),
 	},
-	async ({ customer, vendor, companyName, taxNumber, vatRegistrationId, firstName, lastName, salutation, note }) => {
+	async ({
+		customer, vendor, companyName, taxNumber, vatRegistrationId,
+		firstName, lastName, salutation, note,
+		billingStreet, billingZip, billingCity, billingCountryCode, billingSupplement,
+		shippingStreet, shippingZip, shippingCity, shippingCountryCode, shippingSupplement,
+		emailBusiness, emailOffice, emailPrivate, emailOther,
+		phoneBusiness, phoneOffice, phoneMobile, phonePrivate, phoneFax, phoneOther,
+		contactPersons,
+	}) => {
+		const hasBillingFields = billingStreet !== undefined || billingZip !== undefined || billingCity !== undefined || billingCountryCode !== undefined || billingSupplement !== undefined;
+		const hasShippingFields = shippingStreet !== undefined || shippingZip !== undefined || shippingCity !== undefined || shippingCountryCode !== undefined || shippingSupplement !== undefined;
+
+		const addressesPayload: Record<string, any> = {
+			...(hasBillingFields ? { billing: [{
+				...(billingSupplement !== undefined ? { supplement: billingSupplement } : {}),
+				...(billingStreet !== undefined ? { street: billingStreet } : {}),
+				...(billingZip !== undefined ? { zip: billingZip } : {}),
+				...(billingCity !== undefined ? { city: billingCity } : {}),
+				...(billingCountryCode !== undefined ? { countryCode: billingCountryCode } : {}),
+			}] } : {}),
+			...(hasShippingFields ? { shipping: [{
+				...(shippingSupplement !== undefined ? { supplement: shippingSupplement } : {}),
+				...(shippingStreet !== undefined ? { street: shippingStreet } : {}),
+				...(shippingZip !== undefined ? { zip: shippingZip } : {}),
+				...(shippingCity !== undefined ? { city: shippingCity } : {}),
+				...(shippingCountryCode !== undefined ? { countryCode: shippingCountryCode } : {}),
+			}] } : {}),
+		};
+
+		const emailAddressesPayload: Record<string, any> = {
+			...(emailBusiness !== undefined ? { business: [emailBusiness] } : {}),
+			...(emailOffice !== undefined ? { office: [emailOffice] } : {}),
+			...(emailPrivate !== undefined ? { private: [emailPrivate] } : {}),
+			...(emailOther !== undefined ? { other: [emailOther] } : {}),
+		};
+
+		const phoneNumbersPayload: Record<string, any> = {
+			...(phoneBusiness !== undefined ? { business: [phoneBusiness] } : {}),
+			...(phoneOffice !== undefined ? { office: [phoneOffice] } : {}),
+			...(phoneMobile !== undefined ? { mobile: [phoneMobile] } : {}),
+			...(phonePrivate !== undefined ? { private: [phonePrivate] } : {}),
+			...(phoneFax !== undefined ? { fax: [phoneFax] } : {}),
+			...(phoneOther !== undefined ? { other: [phoneOther] } : {}),
+		};
+
 		const result = await makeLexwareOfficeWriteRequest<any>('/v1/contacts', 'POST', {
 			version: 0,
 			roles: {
 				...(customer ? { customer: {} } : {}),
 				...(vendor ? { vendor: {} } : {}),
 			},
-			...(companyName
-				? { company: { name: companyName, ...(taxNumber ? { taxNumber } : {}), ...(vatRegistrationId ? { vatRegistrationId } : {}) } }
+			...(companyName !== undefined
+				? { company: {
+					name: companyName,
+					...(taxNumber !== undefined ? { taxNumber } : {}),
+					...(vatRegistrationId !== undefined ? { vatRegistrationId } : {}),
+					...(contactPersons !== undefined ? { contactPersons } : {}),
+				} }
 				: {}),
-			...(lastName || firstName ? { person: { ...(salutation ? { salutation } : {}), ...(firstName ? { firstName } : {}), ...(lastName ? { lastName } : {}) } } : {}),
-			...(note ? { note } : {}),
+			...(lastName !== undefined || firstName !== undefined
+				? { person: {
+					...(salutation !== undefined ? { salutation } : {}),
+					...(firstName !== undefined ? { firstName } : {}),
+					...(lastName !== undefined ? { lastName } : {}),
+				} }
+				: {}),
+			...(Object.keys(addressesPayload).length > 0 ? { addresses: addressesPayload } : {}),
+			...(Object.keys(emailAddressesPayload).length > 0 ? { emailAddresses: emailAddressesPayload } : {}),
+			...(Object.keys(phoneNumbersPayload).length > 0 ? { phoneNumbers: phoneNumbersPayload } : {}),
+			...(note !== undefined ? { note } : {}),
 		});
 
 		if (!result || !result.ok) {
