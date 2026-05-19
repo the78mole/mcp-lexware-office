@@ -169,38 +169,100 @@ server.tool(
 			.optional()
 			.default(250)
 			.describe('number of contacts to retrieve per page'),
+		fetchAll: z
+			.boolean()
+			.optional()
+			.default(false)
+			.describe(
+				'if true, auto-fetches all pages sequentially and returns combined results; mutually exclusive with page; size controls batch size per API call',
+			),
 	},
-	async ({ email, name, number, customer, vendor, page, size }) => {
-		const params = new URLSearchParams();
-		if (email) params.append('email', email);
-		if (name) params.append('name', name);
-		if (number) params.append('number', number.toString());
-		if (customer !== undefined) params.append('customer', customer.toString());
-		if (vendor !== undefined) params.append('vendor', vendor.toString());
-		if (page !== undefined) params.append('page', page.toString());
-		params.append('size', size.toString());
-
-		const contactsUrl = `/v1/contacts?${params.toString()}`;
-		const contactsData = await makeLexwareOfficeRequest<any>(contactsUrl);
-
-		if (!contactsData) {
+	async ({ email, name, number, customer, vendor, page, size, fetchAll }) => {
+		// fetchAll + page is a configuration conflict
+		if (fetchAll && page !== undefined) {
 			return {
 				content: [
 					{
 						type: 'text',
-						text: 'Failed to retrieve contacts',
+						text: 'fetchAll and page are mutually exclusive. Use fetchAll: true OR page/size, not both.',
 					},
 				],
 			};
 		}
 
-		const response = `Contacts:\n\n${JSON.stringify(contactsData, null, 2)}`;
+		// Filter params only — page/size appended separately per mode to prevent double-append
+		const filterParams = new URLSearchParams();
+		if (email) filterParams.append('email', email);
+		if (name) filterParams.append('name', name);
+		if (number) filterParams.append('number', number.toString());
+		if (customer !== undefined) filterParams.append('customer', customer.toString());
+		if (vendor !== undefined) filterParams.append('vendor', vendor.toString());
+
+		if (!fetchAll) {
+			// Normal mode
+			const params = new URLSearchParams(filterParams);
+			if (page !== undefined) params.append('page', page.toString());
+			params.append('size', size.toString());
+
+			const contactsData = await makeLexwareOfficeRequest<any>(`/v1/contacts?${params.toString()}`);
+
+			if (!contactsData) {
+				return { content: [{ type: 'text', text: 'Failed to retrieve contacts' }] };
+			}
+
+			return {
+				content: [{ type: 'text', text: `Contacts:\n\n${JSON.stringify(contactsData, null, 2)}` }],
+			};
+		}
+
+		// fetchAll mode — sequential pagination, 550ms delay before each page after page 0
+		const page0Params = new URLSearchParams(filterParams);
+		page0Params.append('page', '0');
+		page0Params.append('size', size.toString());
+
+		const page0Data = await makeLexwareOfficeRequest<any>(`/v1/contacts?${page0Params.toString()}`);
+
+		if (!page0Data) {
+			return { content: [{ type: 'text', text: 'Failed to retrieve contacts (page 0)' }] };
+		}
+
+		const totalPages: number = page0Data.totalPages;
+		const allContacts: any[] = [...page0Data.content];
+		const warnings: string[] = [];
+
+		const delay = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
+		for (let p = 1; p < totalPages; p++) {
+			await delay(550); // before fetch — no trailing wait after final page
+			try {
+				const pageParams = new URLSearchParams(filterParams);
+				pageParams.append('page', p.toString());
+				pageParams.append('size', size.toString());
+				const pageData = await makeLexwareOfficeRequest<any>(`/v1/contacts?${pageParams.toString()}`);
+				if (!pageData) {
+					warnings.push(`Failed to fetch page ${p}: null response`);
+					continue;
+				}
+				allContacts.push(...pageData.content);
+			} catch (err) {
+				warnings.push(`Failed to fetch page ${p}: ${String(err)}`);
+			}
+		}
 
 		return {
 			content: [
 				{
 					type: 'text',
-					text: response,
+					text: JSON.stringify(
+						{
+							totalElements: page0Data.totalElements,
+							totalPages,
+							contacts: allContacts,
+							warnings,
+						},
+						null,
+						2,
+					),
 				},
 			],
 		};
