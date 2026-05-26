@@ -1253,7 +1253,7 @@ server.tool(
 
 server.tool(
 	'update-voucher',
-	'Update an existing bookkeeping voucher in Lexware Office. Requires the current version number (get it from get-voucher-details). All fields from create-voucher are required.',
+	'Update an existing bookkeeping voucher in Lexware Office. Requires the current version number (get it from get-voucher-details). All fields from create-voucher are required. Warning: this operation clears all file attachments. If the voucher has files, re-attach them afterwards using upload-file-to-voucher.',
 	{
 		id: z.string().uuid().describe('The ID of the voucher to update'),
 		version: z.number().int().describe('Current version of the voucher (for optimistic locking)'),
@@ -2098,17 +2098,14 @@ server.tool(
 	'Upload and assign a file (PDF, JPG, PNG, or XML) directly to an existing voucher (Beleg) in Lexware Office. Use this to attach a receipt image or invoice PDF to a bookkeeping entry.',
 	{
 		voucherId: z.string().uuid().describe('The ID of the voucher to attach the file to'),
-		fileContentBase64: z.string().describe('Base64-encoded file content'),
-		fileName: z.string().describe('File name including extension, e.g. "beleg.pdf"'),
-		mimeType: z
-			.enum(['application/pdf', 'image/jpeg', 'image/png', 'application/xml'])
-			.describe('MIME type of the file'),
+		filePath: z.string().describe('Absolute path to the file on the server (max 5 MB). Supported: .pdf, .jpg, .jpeg, .png, .xml'),
 	},
-	async ({ voucherId, fileContentBase64, fileName, mimeType }) => {
-		const fileBuffer = Buffer.from(fileContentBase64, 'base64');
+	async ({ voucherId, filePath }) => {
+		const mimeType = resolveMimeType(filePath);
+		const fileBuffer = readFileSync(filePath);
 		const blob = new Blob([fileBuffer], { type: mimeType });
 		const formData = new FormData();
-		formData.append('file', blob, fileName);
+		formData.append('file', blob, basename(filePath));
 
 		const result = await makeLexwareOfficeMultipartRequest<any>(`/v1/vouchers/${voucherId}/files`, formData);
 
