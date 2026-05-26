@@ -1,3 +1,6 @@
+import { readFileSync } from 'fs';
+import { extname, basename } from 'path';
+
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
@@ -2050,21 +2053,32 @@ server.tool(
 	},
 );
 
+function resolveMimeType(filePath: string): string {
+	const ext = extname(filePath).toLowerCase();
+	const map: Record<string, string> = {
+		'.pdf': 'application/pdf',
+		'.jpg': 'image/jpeg',
+		'.jpeg': 'image/jpeg',
+		'.png': 'image/png',
+		'.xml': 'application/xml',
+	};
+	const mime = map[ext];
+	if (!mime) throw new Error(`Unsupported file extension "${ext}". Supported: .pdf, .jpg, .jpeg, .png, .xml`);
+	return mime;
+}
+
 server.tool(
 	'upload-file',
 	'Upload a file (PDF, JPG, PNG, or XML) to Lexware Office for bookkeeping purposes. Returns a file ID. Max file size: 5 MB. For XML (e-invoice), the "E-Rechnung" feature must be enabled in Lexware Office settings.',
 	{
-		fileContentBase64: z.string().describe('Base64-encoded file content'),
-		fileName: z.string().describe('File name including extension, e.g. "rechnung.pdf"'),
-		mimeType: z
-			.enum(['application/pdf', 'image/jpeg', 'image/png', 'application/xml'])
-			.describe('MIME type of the file'),
+		filePath: z.string().describe('Absolute path to the file on the server (max 5 MB). Supported: .pdf, .jpg, .jpeg, .png, .xml'),
 	},
-	async ({ fileContentBase64, fileName, mimeType }) => {
-		const fileBuffer = Buffer.from(fileContentBase64, 'base64');
+	async ({ filePath }) => {
+		const mimeType = resolveMimeType(filePath);
+		const fileBuffer = readFileSync(filePath);
 		const blob = new Blob([fileBuffer], { type: mimeType });
 		const formData = new FormData();
-		formData.append('file', blob, fileName);
+		formData.append('file', blob, basename(filePath));
 		formData.append('type', 'voucher');
 
 		const result = await makeLexwareOfficeMultipartRequest<any>('/v1/files', formData);
