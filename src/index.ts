@@ -520,8 +520,23 @@ server.tool(
 		lastName: z.string().optional().describe('Last name — for person contacts; required if companyName is not provided'),
 		salutation: z.string().optional().describe('Salutation for person contacts'),
 		note: z.string().optional(),
+		billingAddress: addressEntrySchema.optional().describe('Billing address'),
+		shippingAddress: addressEntrySchema.optional().describe('Shipping address'),
+		emailAddresses: z.object({
+			business: z.array(z.string()).optional(),
+			private: z.array(z.string()).optional(),
+			office: z.array(z.string()).optional(),
+			other: z.array(z.string()).optional(),
+		}).optional().describe('Email addresses grouped by category'),
+		phoneNumbers: z.object({
+			mobile: z.array(z.string()).optional(),
+			business: z.array(z.string()).optional(),
+			private: z.array(z.string()).optional(),
+			fax: z.array(z.string()).optional(),
+			other: z.array(z.string()).optional(),
+		}).optional().describe('Phone numbers grouped by category'),
 	},
-	async ({ customer, vendor, companyName, taxNumber, vatRegistrationId, firstName, lastName, salutation, note }) => {
+	async ({ customer, vendor, companyName, taxNumber, vatRegistrationId, firstName, lastName, salutation, note, billingAddress, shippingAddress, emailAddresses, phoneNumbers }) => {
 		const result = await makeLexwareOfficeWriteRequest<any>('/v1/contacts', 'POST', {
 			version: 0,
 			roles: {
@@ -533,6 +548,14 @@ server.tool(
 				: {}),
 			...(lastName || firstName ? { person: { ...(salutation ? { salutation } : {}), ...(firstName ? { firstName } : {}), ...(lastName ? { lastName } : {}) } } : {}),
 			...(note ? { note } : {}),
+			...(billingAddress || shippingAddress ? {
+				addresses: {
+					...(billingAddress ? { billing: [billingAddress] } : {}),
+					...(shippingAddress ? { shipping: [shippingAddress] } : {}),
+				},
+			} : {}),
+			...(emailAddresses ? { emailAddresses } : {}),
+			...(phoneNumbers ? { phoneNumbers } : {}),
 		});
 
 		if (!result || !result.ok) {
@@ -554,7 +577,7 @@ server.tool(
 
 server.tool(
 	'update-contact',
-	'Update an existing contact in Lexware Office. Requires the current version number for optimistic locking (get it from get-contacts).',
+	'Update an existing contact in Lexware Office. Requires the current version number for optimistic locking (get it from get-contacts). Note: this is a full PUT — always include all existing fields, not just the ones you want to change.',
 	{
 		id: z.string().uuid().describe('The ID of the contact to update'),
 		version: z.number().int().describe('Current version of the contact (for optimistic locking)'),
@@ -567,8 +590,23 @@ server.tool(
 		lastName: z.string().optional().describe('Last name — for person contacts'),
 		salutation: z.string().optional().describe('Salutation for person contacts'),
 		note: z.string().optional(),
+		billingAddress: addressEntrySchema.optional().describe('Billing address'),
+		shippingAddress: addressEntrySchema.optional().describe('Shipping address'),
+		emailAddresses: z.object({
+			business: z.array(z.string()).optional(),
+			private: z.array(z.string()).optional(),
+			office: z.array(z.string()).optional(),
+			other: z.array(z.string()).optional(),
+		}).optional().describe('Email addresses grouped by category'),
+		phoneNumbers: z.object({
+			mobile: z.array(z.string()).optional(),
+			business: z.array(z.string()).optional(),
+			private: z.array(z.string()).optional(),
+			fax: z.array(z.string()).optional(),
+			other: z.array(z.string()).optional(),
+		}).optional().describe('Phone numbers grouped by category'),
 	},
-	async ({ id, customer, vendor, companyName, taxNumber, vatRegistrationId, firstName, lastName, salutation, note, version }) => {
+	async ({ id, customer, vendor, companyName, taxNumber, vatRegistrationId, firstName, lastName, salutation, note, version, billingAddress, shippingAddress, emailAddresses, phoneNumbers }) => {
 		if (!customer && !vendor) {
 			return {
 				content: [{ type: 'text', text: 'Error: Lexoffice requires at least one role. Set customer or vendor to "true".' }],
@@ -586,6 +624,14 @@ server.tool(
 				: {}),
 			...(lastName || firstName ? { person: { ...(salutation ? { salutation } : {}), ...(firstName ? { firstName } : {}), ...(lastName ? { lastName } : {}) } } : {}),
 			...(note ? { note } : {}),
+			...(billingAddress || shippingAddress ? {
+				addresses: {
+					...(billingAddress ? { billing: [billingAddress] } : {}),
+					...(shippingAddress ? { shipping: [shippingAddress] } : {}),
+				},
+			} : {}),
+			...(emailAddresses ? { emailAddresses } : {}),
+			...(phoneNumbers ? { phoneNumbers } : {}),
 		});
 
 		if (!result || !result.ok) {
@@ -624,18 +670,29 @@ server.tool(
 	},
 );
 
+const lineItemBaseSchema = z.object({
+	name: z.string().describe('Line item description'),
+	quantity: z.number().describe('Quantity'),
+	unitName: z.string().describe('Unit name, e.g. "Stunden", "Stück"'),
+	unitPrice: z.object({
+		currency: z.literal('EUR'),
+		netAmount: z.string().describe('Net amount as string, e.g. "9.99"'),
+		taxRatePercentage: z.number().describe('Tax rate, e.g. 19 for 19%'),
+	}),
+	discountPercentage: z.number().min(0).max(100).optional(),
+});
+
 const lineItemSchema = z.discriminatedUnion('type', [
-	z.object({
-		type: z.enum(['material', 'service', 'custom']),
-		name: z.string().describe('Line item description'),
-		quantity: z.number().describe('Quantity'),
-		unitName: z.string().describe('Unit name, e.g. "Stunden", "Stück"'),
-		unitPrice: z.object({
-			currency: z.literal('EUR'),
-			netAmount: z.string().describe('Net amount as string, e.g. "9.99"'),
-			taxRatePercentage: z.number().describe('Tax rate, e.g. 19 for 19%'),
-		}),
-		discountPercentage: z.number().min(0).max(100).optional(),
+	lineItemBaseSchema.extend({
+		type: z.literal('service'),
+		id: z.string().uuid().optional().describe('Catalog article UUID — required by the API when type is "service"; use list-articles to find valid IDs'),
+	}),
+	lineItemBaseSchema.extend({
+		type: z.literal('material'),
+		id: z.string().uuid().optional().describe('Catalog article UUID — required by the API when type is "material"; use list-articles to find valid IDs'),
+	}),
+	lineItemBaseSchema.extend({
+		type: z.literal('custom'),
 	}),
 	z.object({
 		type: z.literal('text'),
@@ -715,14 +772,14 @@ async function handleInvoiceRequest(
 
 server.tool(
 	'create-invoice',
-	'Create a new invoice as a draft in Lexware Office. The invoice will not be sent to the customer. Use finalize-invoice to create and immediately finalize.',
+	'Create a new invoice as a draft in Lexware Office. The invoice will not be sent to the customer. Use finalize-invoice to create and immediately finalize. For lineItems: use type "custom" for free-form positions without a catalog reference; use type "service" or "material" only when you have a valid article UUID from list-articles (the API requires the id field in those cases).',
 	invoiceSchema,
 	async (params) => handleInvoiceRequest(params, false),
 );
 
 server.tool(
 	'finalize-invoice',
-	'Create and immediately finalize (publish) an invoice in Lexware Office. The invoice will be locked and cannot be edited. Use create-invoice to create a draft first.',
+	'Create and immediately finalize (publish) an invoice in Lexware Office. The invoice will be locked and cannot be edited. Use create-invoice to create a draft first. For lineItems: use type "custom" for free-form positions without a catalog reference; use type "service" or "material" only when you have a valid article UUID from list-articles (the API requires the id field in those cases).',
 	invoiceSchema,
 	async (params) => handleInvoiceRequest(params, true),
 );
@@ -1273,14 +1330,14 @@ async function handleQuotationRequest(
 
 server.tool(
 	'create-quotation',
-	'Create a new quotation (Angebot) as a draft in Lexware Office. The quotation will not be sent to the customer. Use finalize-quotation to create and immediately finalize.',
+	'Create a new quotation (Angebot) as a draft in Lexware Office. The quotation will not be sent to the customer. Use finalize-quotation to create and immediately finalize. For lineItems: use type "custom" for free-form positions without a catalog reference; use type "service" or "material" only when you have a valid article UUID from list-articles (the API requires the id field in those cases).',
 	quotationSchema,
 	async (params) => handleQuotationRequest(params, false),
 );
 
 server.tool(
 	'finalize-quotation',
-	'Create and immediately finalize (publish) a quotation (Angebot) in Lexware Office. The quotation will be locked and cannot be edited. Use create-quotation to create a draft first.',
+	'Create and immediately finalize (publish) a quotation (Angebot) in Lexware Office. The quotation will be locked and cannot be edited. Use create-quotation to create a draft first. For lineItems: use type "custom" for free-form positions without a catalog reference; use type "service" or "material" only when you have a valid article UUID from list-articles (the API requires the id field in those cases).',
 	quotationSchema,
 	async (params) => handleQuotationRequest(params, true),
 );
