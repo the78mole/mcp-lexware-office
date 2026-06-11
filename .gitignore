@@ -1,4 +1,6 @@
 mcp-server.log
+docs/
+.worktrees/
 
 # Logs
 logs

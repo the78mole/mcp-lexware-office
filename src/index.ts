@@ -1,3 +1,6 @@
+import { readFileSync } from 'fs';
+import { extname, basename } from 'path';
+
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
@@ -36,12 +39,17 @@ const server = new McpServer({
 
 server.tool(
 	'get-invoices',
-	'Get a list of invoices from Lexware Office',
+	'Get a list of natively created invoices from Lexware Office. IMPORTANT: This only returns invoices created directly in Lexware Office. Externally created invoices imported as bookkeeping entries (Ausgangsbelege) are NOT included here — use get-vouchers with voucherType=salesinvoice for those. For a complete picture of what a customer owes, use get-open-receivables instead.',
 	{
 		status: z
 			.array(z.enum(['open', 'draft', 'paid', 'paidoff', 'voided']))
 			.optional()
 			.default(['open', 'draft', 'paid', 'paidoff', 'voided']),
+		contactId: z
+			.string()
+			.uuid()
+			.optional()
+			.describe('Filter by contact ID — returns only invoices for this customer/vendor'),
 		page: z.number().min(0).optional().default(0).describe('page number to retrieve; starts at 0'),
 		size: z
 			.number()
@@ -51,8 +59,9 @@ server.tool(
 			.default(250)
 			.describe('number of invoices to retrieve per page'),
 	},
-	async ({ status }) => {
-		const voucherlistUrl = `/v1/voucherlist?voucherType=invoice&voucherStatus=${status.join(',')}`;
+	async ({ status, contactId, page, size }) => {
+		let voucherlistUrl = `/v1/voucherlist?voucherType=invoice&voucherStatus=${status.join(',')}&page=${page}&size=${size}`;
+		if (contactId) voucherlistUrl += `&contactId=${contactId}`;
 		const voucherlistData = await makeLexwareOfficeRequest<any>(voucherlistUrl);
 		const vouchers = voucherlistData.content;
 
@@ -155,7 +164,7 @@ server.tool(
 			.describe(
 				'if set to true filters contacts that have the role vendor, if set to false filters contacts that do not have the vendor role',
 			),
-		page: z.number().min(0).optional().default(0).describe('page number to retrieve; starts at 0'),
+		page: z.number().min(0).optional().describe('page number to retrieve; starts at 0; mutually exclusive with fetchAll'),
 		size: z
 			.number()
 			.min(1)
@@ -163,36 +172,100 @@ server.tool(
 			.optional()
 			.default(250)
 			.describe('number of contacts to retrieve per page'),
+		fetchAll: z
+			.boolean()
+			.optional()
+			.default(false)
+			.describe(
+				'if true, auto-fetches all pages sequentially and returns combined results; mutually exclusive with page; size controls batch size per API call',
+			),
 	},
-	async ({ email, name, number, customer, vendor }) => {
-		const params = new URLSearchParams();
-		if (email) params.append('email', email);
-		if (name) params.append('name', name);
-		if (number) params.append('number', number.toString());
-		if (customer !== undefined) params.append('customer', customer.toString());
-		if (vendor !== undefined) params.append('vendor', vendor.toString());
-
-		const contactsUrl = `/v1/contacts?${params.toString()}`;
-		const contactsData = await makeLexwareOfficeRequest<any>(contactsUrl);
-
-		if (!contactsData) {
+	async ({ email, name, number, customer, vendor, page, size, fetchAll }) => {
+		// fetchAll + page is a configuration conflict
+		if (fetchAll && page !== undefined) {
 			return {
 				content: [
 					{
 						type: 'text',
-						text: 'Failed to retrieve contacts',
+						text: 'fetchAll and page are mutually exclusive. Use fetchAll: true OR page/size, not both.',
 					},
 				],
 			};
 		}
 
-		const response = `Contacts:\n\n${JSON.stringify(contactsData, null, 2)}`;
+		// Filter params only — page/size appended separately per mode to prevent double-append
+		const filterParams = new URLSearchParams();
+		if (email) filterParams.append('email', email);
+		if (name) filterParams.append('name', name);
+		if (number) filterParams.append('number', number.toString());
+		if (customer !== undefined) filterParams.append('customer', customer.toString());
+		if (vendor !== undefined) filterParams.append('vendor', vendor.toString());
+
+		if (!fetchAll) {
+			// Normal mode
+			const params = new URLSearchParams(filterParams);
+			if (page !== undefined) params.append('page', page.toString());
+			params.append('size', size.toString());
+
+			const contactsData = await makeLexwareOfficeRequest<any>(`/v1/contacts?${params.toString()}`);
+
+			if (!contactsData) {
+				return { content: [{ type: 'text', text: 'Failed to retrieve contacts' }] };
+			}
+
+			return {
+				content: [{ type: 'text', text: `Contacts:\n\n${JSON.stringify(contactsData, null, 2)}` }],
+			};
+		}
+
+		// fetchAll mode — sequential pagination, 550ms delay before each page after page 0
+		const page0Params = new URLSearchParams(filterParams);
+		page0Params.append('page', '0');
+		page0Params.append('size', size.toString());
+
+		const page0Data = await makeLexwareOfficeRequest<any>(`/v1/contacts?${page0Params.toString()}`);
+
+		if (!page0Data) {
+			return { content: [{ type: 'text', text: 'Failed to retrieve contacts (page 0)' }] };
+		}
+
+		const totalPages: number = page0Data.totalPages;
+		const allContacts: any[] = [...page0Data.content];
+		const warnings: string[] = [];
+
+		const delay = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
+		for (let p = 1; p < totalPages; p++) {
+			await delay(550); // before fetch — no trailing wait after final page
+			try {
+				const pageParams = new URLSearchParams(filterParams);
+				pageParams.append('page', p.toString());
+				pageParams.append('size', size.toString());
+				const pageData = await makeLexwareOfficeRequest<any>(`/v1/contacts?${pageParams.toString()}`);
+				if (!pageData) {
+					warnings.push(`Failed to fetch page ${p}: null response`);
+					continue;
+				}
+				allContacts.push(...pageData.content);
+			} catch (err) {
+				warnings.push(`Failed to fetch page ${p}: ${String(err)}`);
+			}
+		}
 
 		return {
 			content: [
 				{
 					type: 'text',
-					text: response,
+					text: JSON.stringify(
+						{
+							totalElements: page0Data.totalElements,
+							totalPages,
+							contacts: allContacts,
+							warnings,
+						},
+						null,
+						2,
+					),
 				},
 			],
 		};
@@ -288,7 +361,7 @@ server.tool(
 
 server.tool(
 	'get-vouchers',
-	'Get a list of bookkeeping vouchers (Eingangsbelege/Ausgangsbelege) from Lexware Office. Voucher types: purchaseinvoice (Ausgaben), purchasecreditnote (Ausgabenminderung), salesinvoice (Einnahmen), salescreditnote (Einnahmenminderung).',
+	'Get a list of bookkeeping vouchers (Eingangsbelege/Ausgangsbelege) from Lexware Office. These are invoices/receipts that were created externally and imported into Lexware Office for bookkeeping — NOT natively created invoices (use get-invoices for those). Voucher types: purchaseinvoice (Eingangsrechnung/Ausgaben), purchasecreditnote (Eingangsgutschrift), salesinvoice (Ausgangsrechnung/Einnahmen — externally created), salescreditnote (Ausgangsgutschrift). To find open customer receivables from externally created invoices, use voucherType=salesinvoice with voucherStatus=open. For a complete receivables picture across both sources, use get-open-receivables. For direct lookup by invoice number, use the voucherNumber parameter instead of loading all vouchers.',
 	{
 		voucherType: z
 			.array(
@@ -304,17 +377,28 @@ server.tool(
 			.optional()
 			.default(['unchecked', 'open', 'paid', 'paidoff', 'voided', 'transferred', 'sepadebit'])
 			.describe('Filter by voucher status'),
+		voucherNumber: z
+			.string()
+			.optional()
+			.describe('Filter by voucher number (e.g. "EK-2025-0001"). Use for direct lookup — avoids loading all vouchers. Match semantics (exact vs. partial) depend on Lexware API.'),
+		contactId: z
+			.string()
+			.uuid()
+			.optional()
+			.describe('Filter by contact ID — returns only vouchers for this customer/vendor'),
 		page: z.number().min(0).optional().default(0).describe('page number to retrieve; starts at 0'),
 		size: z
 			.number()
 			.min(1)
 			.max(250)
 			.optional()
-			.default(250)
+			.default(50)
 			.describe('number of vouchers to retrieve per page'),
 	},
-	async ({ voucherType, voucherStatus, page, size }) => {
-		const voucherlistUrl = `/v1/voucherlist?voucherType=${voucherType.join(',')}&voucherStatus=${voucherStatus.join(',')}&page=${page}&size=${size}`;
+	async ({ voucherType, voucherStatus, contactId, voucherNumber, page, size }) => {
+		let voucherlistUrl = `/v1/voucherlist?voucherType=${voucherType.join(',')}&voucherStatus=${voucherStatus.join(',')}&page=${page}&size=${size}`;
+		if (contactId) voucherlistUrl += `&contactId=${contactId}`;
+		if (voucherNumber) voucherlistUrl += `&voucherNumber=${encodeURIComponent(voucherNumber)}`;
 		const voucherlistData = await makeLexwareOfficeRequest<any>(voucherlistUrl);
 		const vouchers = voucherlistData?.content;
 
@@ -338,6 +422,59 @@ server.tool(
 					text: response,
 				},
 			],
+		};
+	},
+);
+
+server.tool(
+	'get-open-receivables',
+	'Get all open receivables (offene Forderungen) for a specific customer — combining both natively created invoices AND externally imported Ausgangsbelege (salesinvoice vouchers). Use this when asked: "How much does customer X owe?", "What invoices are open for customer Y?", "What is the outstanding balance for customer Z?". Returns a consolidated summary with total amount due.',
+	{
+		contactId: z.string().uuid().describe('The ID of the contact (customer) to check receivables for'),
+		page: z.number().min(0).optional().default(0).describe('page number to retrieve; starts at 0'),
+		size: z.number().min(1).max(250).optional().default(250).describe('number of records per page'),
+	},
+	async ({ contactId, page, size }) => {
+		const [invoicesData, vouchersData] = await Promise.all([
+			makeLexwareOfficeRequest<any>(
+				`/v1/voucherlist?voucherType=invoice&voucherStatus=open,draft&contactId=${contactId}&page=${page}&size=${size}`,
+			),
+			makeLexwareOfficeRequest<any>(
+				`/v1/voucherlist?voucherType=salesinvoice&voucherStatus=open,unchecked&contactId=${contactId}&page=${page}&size=${size}`,
+			),
+		]);
+
+		const nativeInvoices = invoicesData?.content ?? [];
+		const salesVouchers = vouchersData?.content ?? [];
+
+		if (nativeInvoices.length === 0 && salesVouchers.length === 0) {
+			return {
+				content: [{ type: 'text', text: 'No open receivables found for this contact.' }],
+			};
+		}
+
+		const totalNative = nativeInvoices.reduce((sum: number, v: any) => sum + (v.totalAmount ?? 0), 0);
+		const totalVouchers = salesVouchers.reduce((sum: number, v: any) => sum + (v.totalAmount ?? 0), 0);
+		const grandTotal = totalNative + totalVouchers;
+
+		const lines: string[] = [
+			`Open receivables for contact ${contactId}:`,
+			``,
+			`Native invoices (created in Lexware Office): ${nativeInvoices.length} — ${totalNative.toFixed(2)} €`,
+			`Ausgangsbelege (externally created, imported): ${salesVouchers.length} — ${totalVouchers.toFixed(2)} €`,
+			``,
+			`TOTAL OUTSTANDING: ${grandTotal.toFixed(2)} €`,
+		];
+
+		if (nativeInvoices.length > 0) {
+			lines.push(`\n--- Native Invoices ---\n${JSON.stringify(nativeInvoices, null, 2)}`);
+		}
+		if (salesVouchers.length > 0) {
+			lines.push(`\n--- Ausgangsbelege (salesinvoice vouchers) ---\n${JSON.stringify(salesVouchers, null, 2)}`);
+		}
+
+		return {
+			content: [{ type: 'text', text: lines.join('\n') }],
 		};
 	},
 );
@@ -378,9 +515,9 @@ server.tool(
 
 server.tool(
 	'get-file',
-	'Download a file (PDF or XML) from Lexware Office by its file ID. File IDs are found in the \'files.documentFileId\' field of voucher or invoice details.',
+	'Download a file (PDF or XML) from Lexware Office by its file ID. Note: the files.documentFileId field is deprecated — prefer get-document-file when you have a document ID. Use this tool only when you have a raw file ID (e.g. from voucher file attachments).',
 	{
-		id: z.string().uuid().describe('The file ID from the files.documentFileId field in voucher or invoice details'),
+		id: z.string().uuid().describe('The file ID (not a document ID — use get-document-file for invoices/quotations/etc.)'),
 		format: z
 			.enum(['pdf', 'xml'])
 			.optional()
@@ -419,7 +556,7 @@ server.tool(
 
 server.tool(
 	'get-document-file',
-	'Download the PDF file of a document (invoice, quotation, credit note, order confirmation, delivery note, dunning, or down-payment invoice) by its document ID. Note: Lexware Office may reject this for documents whose PDF has not been rendered yet; in that case, use get-file with a known documentFileId.',
+	'Download the PDF file of a finalized document (invoice, quotation, credit note, order confirmation, delivery note, dunning, or down-payment invoice) directly by its document ID. Use this instead of get-file when you have a document ID rather than a file ID.',
 	{
 		docType: z
 			.enum(['invoices', 'credit-notes', 'quotations', 'order-confirmations', 'delivery-notes', 'dunnings', 'down-payment-invoices'])
@@ -455,9 +592,8 @@ server.tool(
 		id: z.string().uuid().describe('The ID of the invoice or voucher to retrieve payment information for'),
 	},
 	async ({ id }) => {
-		const LEXOFFICE_API_BASE = 'https://api.lexoffice.io';
 		const LEXWARE_OFFICE_API_KEY = process.env.LEXWARE_OFFICE_API_KEY!;
-		const response = await fetch(`${LEXOFFICE_API_BASE}/v1/payments/${id}`, {
+		const response = await fetch(`https://api.lexware.io/v1/payments/${id}`, {
 			headers: {
 				Accept: 'application/json',
 				Authorization: `Bearer ${LEXWARE_OFFICE_API_KEY}`,
@@ -470,6 +606,12 @@ server.tool(
 
 		let body: unknown;
 		try { body = await response.json(); } catch { body = null; }
+
+		if (response.status === 406) {
+			return {
+				content: [{ type: 'text', text: "Keine Zahlungsinformationen verfügbar — Beleg hat Status 'unchecked'. Zahlungen werden intern von Lexware gesetzt (nach manueller Eingabe oder Bank-Matching)." }],
+			};
+		}
 
 		if (!response.ok) {
 			return {
@@ -509,10 +651,10 @@ server.tool(
 
 server.tool(
 	'create-contact',
-	'Create a new contact in Lexware Office. Provide companyName for a company contact, or firstName/lastName for a person. Set customer and/or vendor to true.',
+	'Create a new contact in Lexware Office. For company contacts: provide companyName and optionally contactPersons (max. 1) with emailAddress. For person contacts: provide firstName/lastName. Supports billing/shipping address, email addresses (business/office/private/other), and phone numbers. Set customer and/or vendor to true. API limit: max. one entry per email/phone list, max. one contactPerson.',
 	{
-		customer: z.string().optional().transform(v => v === 'true').describe('Set to "true" to assign the customer role'),
-		vendor: z.string().optional().transform(v => v === 'true').describe('Set to "true" to assign the vendor role'),
+		customer: z.boolean().optional().describe('Set to true to assign the customer role'),
+		vendor: z.boolean().optional().describe('Set to true to assign the vendor role'),
 		companyName: z.string().optional().describe('Company name — provide either companyName or lastName, not both'),
 		taxNumber: z.string().optional().describe('Tax number of the company'),
 		vatRegistrationId: z.string().optional().describe('VAT registration ID of the company'),
@@ -520,19 +662,110 @@ server.tool(
 		lastName: z.string().optional().describe('Last name — for person contacts; required if companyName is not provided'),
 		salutation: z.string().optional().describe('Salutation for person contacts'),
 		note: z.string().optional(),
+		billingStreet: z.string().optional().describe('Street and house number of the billing address'),
+		billingZip: z.string().optional().describe('Postal code of the billing address'),
+		billingCity: z.string().optional().describe('City of the billing address'),
+		billingCountryCode: z.string().length(2).optional().describe('ISO 3166-1 alpha-2 country code, e.g. "DE"'),
+		billingSupplement: z.string().optional().describe('Optional address supplement (Adresszusatz)'),
+		shippingStreet: z.string().optional().describe('Street and house number of the shipping address'),
+		shippingZip: z.string().optional().describe('Postal code of the shipping address'),
+		shippingCity: z.string().optional().describe('City of the shipping address'),
+		shippingCountryCode: z.string().length(2).optional().describe('ISO 3166-1 alpha-2 country code, e.g. "DE"'),
+		shippingSupplement: z.string().optional().describe('Optional address supplement for shipping'),
+		emailBusiness: z.string().optional().describe('Business email address (max. 1 per type — API limit)'),
+		emailOffice: z.string().optional().describe('Office email address (max. 1 per type — API limit)'),
+		emailPrivate: z.string().optional().describe('Private email address (max. 1 per type — API limit)'),
+		emailOther: z.string().optional().describe('Other email address (max. 1 per type — API limit)'),
+		phoneBusiness: z.string().optional().describe('Business phone number (max. 1 per type — API limit)'),
+		phoneOffice: z.string().optional().describe('Office phone number (max. 1 per type — API limit)'),
+		phoneMobile: z.string().optional().describe('Mobile phone number (max. 1 per type — API limit)'),
+		phonePrivate: z.string().optional().describe('Private phone number (max. 1 per type — API limit)'),
+		phoneFax: z.string().optional().describe('Fax number (max. 1 per type — API limit)'),
+		phoneOther: z.string().optional().describe('Other phone number (max. 1 per type — API limit)'),
+		contactPersons: z
+			.array(
+				z.object({
+					salutation: z.string().optional(),
+					firstName: z.string().optional(),
+					lastName: z.string(),
+					primary: z.boolean().optional(),
+					emailAddress: z.string().optional(),
+					phoneNumber: z.string().optional(),
+				}),
+			)
+			.optional()
+			.describe('Contact persons for company contacts. Max. 1 entry (API limit).'),
 	},
-	async ({ customer, vendor, companyName, taxNumber, vatRegistrationId, firstName, lastName, salutation, note }) => {
+	async ({
+		customer, vendor, companyName, taxNumber, vatRegistrationId,
+		firstName, lastName, salutation, note,
+		billingStreet, billingZip, billingCity, billingCountryCode, billingSupplement,
+		shippingStreet, shippingZip, shippingCity, shippingCountryCode, shippingSupplement,
+		emailBusiness, emailOffice, emailPrivate, emailOther,
+		phoneBusiness, phoneOffice, phoneMobile, phonePrivate, phoneFax, phoneOther,
+		contactPersons,
+	}) => {
+		const hasBillingFields = billingStreet !== undefined || billingZip !== undefined || billingCity !== undefined || billingCountryCode !== undefined || billingSupplement !== undefined;
+		const hasShippingFields = shippingStreet !== undefined || shippingZip !== undefined || shippingCity !== undefined || shippingCountryCode !== undefined || shippingSupplement !== undefined;
+
+		const addressesPayload: Record<string, any> = {
+			...(hasBillingFields ? { billing: [{
+				...(billingSupplement !== undefined ? { supplement: billingSupplement } : {}),
+				...(billingStreet !== undefined ? { street: billingStreet } : {}),
+				...(billingZip !== undefined ? { zip: billingZip } : {}),
+				...(billingCity !== undefined ? { city: billingCity } : {}),
+				...(billingCountryCode !== undefined ? { countryCode: billingCountryCode } : {}),
+			}] } : {}),
+			...(hasShippingFields ? { shipping: [{
+				...(shippingSupplement !== undefined ? { supplement: shippingSupplement } : {}),
+				...(shippingStreet !== undefined ? { street: shippingStreet } : {}),
+				...(shippingZip !== undefined ? { zip: shippingZip } : {}),
+				...(shippingCity !== undefined ? { city: shippingCity } : {}),
+				...(shippingCountryCode !== undefined ? { countryCode: shippingCountryCode } : {}),
+			}] } : {}),
+		};
+
+		const emailAddressesPayload: Record<string, any> = {
+			...(emailBusiness !== undefined ? { business: [emailBusiness] } : {}),
+			...(emailOffice !== undefined ? { office: [emailOffice] } : {}),
+			...(emailPrivate !== undefined ? { private: [emailPrivate] } : {}),
+			...(emailOther !== undefined ? { other: [emailOther] } : {}),
+		};
+
+		const phoneNumbersPayload: Record<string, any> = {
+			...(phoneBusiness !== undefined ? { business: [phoneBusiness] } : {}),
+			...(phoneOffice !== undefined ? { office: [phoneOffice] } : {}),
+			...(phoneMobile !== undefined ? { mobile: [phoneMobile] } : {}),
+			...(phonePrivate !== undefined ? { private: [phonePrivate] } : {}),
+			...(phoneFax !== undefined ? { fax: [phoneFax] } : {}),
+			...(phoneOther !== undefined ? { other: [phoneOther] } : {}),
+		};
+
 		const result = await makeLexwareOfficeWriteRequest<any>('/v1/contacts', 'POST', {
 			version: 0,
 			roles: {
 				...(customer ? { customer: {} } : {}),
 				...(vendor ? { vendor: {} } : {}),
 			},
-			...(companyName
-				? { company: { name: companyName, ...(taxNumber ? { taxNumber } : {}), ...(vatRegistrationId ? { vatRegistrationId } : {}) } }
+			...(companyName !== undefined
+				? { company: {
+					name: companyName,
+					...(taxNumber !== undefined ? { taxNumber } : {}),
+					...(vatRegistrationId !== undefined ? { vatRegistrationId } : {}),
+					...(contactPersons !== undefined ? { contactPersons } : {}),
+				} }
 				: {}),
-			...(lastName || firstName ? { person: { ...(salutation ? { salutation } : {}), ...(firstName ? { firstName } : {}), ...(lastName ? { lastName } : {}) } } : {}),
-			...(note ? { note } : {}),
+			...(lastName !== undefined || firstName !== undefined
+				? { person: {
+					...(salutation !== undefined ? { salutation } : {}),
+					...(firstName !== undefined ? { firstName } : {}),
+					...(lastName !== undefined ? { lastName } : {}),
+				} }
+				: {}),
+			...(Object.keys(addressesPayload).length > 0 ? { addresses: addressesPayload } : {}),
+			...(Object.keys(emailAddressesPayload).length > 0 ? { emailAddresses: emailAddressesPayload } : {}),
+			...(Object.keys(phoneNumbersPayload).length > 0 ? { phoneNumbers: phoneNumbersPayload } : {}),
+			...(note !== undefined ? { note } : {}),
 		});
 
 		if (!result || !result.ok) {
@@ -554,38 +787,163 @@ server.tool(
 
 server.tool(
 	'update-contact',
-	'Update an existing contact in Lexware Office. Requires the current version number for optimistic locking (get it from get-contacts).',
+	'Update an existing contact in Lexware Office. Requires the current version number for optimistic locking (get it from get-contacts). Note: The Lexware API only supports contacts with at most one billing and one shipping address.',
 	{
 		id: z.string().uuid().describe('The ID of the contact to update'),
 		version: z.number().int().describe('Current version of the contact (for optimistic locking)'),
-		customer: z.string().optional().transform(v => v === 'true').describe('Set to "true" to assign the customer role'),
-		vendor: z.string().optional().transform(v => v === 'true').describe('Set to "true" to assign the vendor role'),
+		customer: z.boolean().optional().describe('Set to true to assign the customer role'),
+		vendor: z.boolean().optional().describe('Set to true to assign the vendor role'),
 		companyName: z.string().optional().describe('Company name'),
 		taxNumber: z.string().optional().describe('Tax number of the company'),
 		vatRegistrationId: z.string().optional().describe('VAT registration ID of the company'),
+		allowTaxFreeInvoices: z.boolean().optional().describe('Allow tax-free invoices for this company'),
 		firstName: z.string().optional().describe('First name — for person contacts'),
 		lastName: z.string().optional().describe('Last name — for person contacts'),
 		salutation: z.string().optional().describe('Salutation for person contacts'),
 		note: z.string().optional(),
+		billingStreet: z.string().optional().describe('Street and house number of the billing address'),
+		billingZip: z.string().optional().describe('Postal code of the billing address'),
+		billingCity: z.string().optional().describe('City of the billing address'),
+		billingCountryCode: z.string().length(2).optional().describe('ISO 3166-1 alpha-2 country code, e.g. "DE"'),
+		billingSupplement: z.string().optional().describe('Optional address supplement (Adresszusatz)'),
+		shippingStreet: z.string().optional().describe('Street and house number of the shipping address'),
+		shippingZip: z.string().optional().describe('Postal code of the shipping address'),
+		shippingCity: z.string().optional().describe('City of the shipping address'),
+		shippingCountryCode: z.string().length(2).optional().describe('ISO 3166-1 alpha-2 country code, e.g. "DE"'),
+		shippingSupplement: z.string().optional().describe('Optional address supplement for shipping'),
+		emailBusiness: z.string().optional().describe('Business email address'),
+		emailOffice: z.string().optional().describe('Office email address'),
+		emailPrivate: z.string().optional().describe('Private email address'),
+		emailOther: z.string().optional().describe('Other email address'),
+		phoneBusiness: z.string().optional().describe('Business phone number'),
+		phoneOffice: z.string().optional().describe('Office phone number'),
+		phoneMobile: z.string().optional().describe('Mobile phone number'),
+		phonePrivate: z.string().optional().describe('Private phone number'),
+		phoneFax: z.string().optional().describe('Fax number'),
+		phoneOther: z.string().optional().describe('Other phone number'),
+		contactPersons: z
+			.array(
+				z.object({
+					salutation: z.string().optional(),
+					firstName: z.string().optional(),
+					lastName: z.string(),
+					primary: z.boolean().optional(),
+					emailAddress: z.string().optional(),
+					phoneNumber: z.string().optional(),
+				}),
+			)
+			.optional()
+			.describe('List of contact persons for company contacts. Replaces all existing contact persons.'),
 	},
-	async ({ id, customer, vendor, companyName, taxNumber, vatRegistrationId, firstName, lastName, salutation, note, version }) => {
+	async ({
+		id, customer, vendor, companyName, taxNumber, vatRegistrationId, allowTaxFreeInvoices,
+		firstName, lastName, salutation, note, version,
+		billingStreet, billingZip, billingCity, billingCountryCode, billingSupplement,
+		shippingStreet, shippingZip, shippingCity, shippingCountryCode, shippingSupplement,
+		emailBusiness, emailOffice, emailPrivate, emailOther,
+		phoneBusiness, phoneOffice, phoneMobile, phonePrivate, phoneFax, phoneOther,
+		contactPersons,
+	}) => {
 		if (!customer && !vendor) {
 			return {
-				content: [{ type: 'text', text: 'Error: Lexoffice requires at least one role. Set customer or vendor to "true".' }],
+				content: [{ type: 'text', text: 'Error: Lexoffice requires at least one role. Set customer or vendor to true.' }],
 			};
 		}
+
+		const existing = await makeLexwareOfficeRequest<any>(`/v1/contacts/${id}`);
+		if (!existing) {
+			return { content: [{ type: 'text', text: 'Failed to fetch existing contact data' }] };
+		}
+
+		const existingRoles: Record<string, any> = existing.roles ?? {};
 		const apiRoles = {
-			...(customer ? { customer: {} } : {}),
-			...(vendor ? { vendor: {} } : {}),
+			...(customer ? { customer: existingRoles.customer ?? {} } : {}),
+			...(vendor ? { vendor: existingRoles.vendor ?? {} } : {}),
 		};
+
+		// Addresses — preserve existing, merge new fields
+		const hasBillingFields = billingStreet !== undefined || billingZip !== undefined || billingCity !== undefined || billingCountryCode !== undefined || billingSupplement !== undefined;
+		const hasShippingFields = shippingStreet !== undefined || shippingZip !== undefined || shippingCity !== undefined || shippingCountryCode !== undefined || shippingSupplement !== undefined;
+		const existingBillingArr: Record<string, any>[] = existing.addresses?.billing ?? [];
+		const existingShippingArr: Record<string, any>[] = existing.addresses?.shipping ?? [];
+		const billingArray: Record<string, any>[] = hasBillingFields
+			? [{
+				...(existingBillingArr[0] ?? {}),
+				...(billingSupplement !== undefined ? { supplement: billingSupplement } : {}),
+				...(billingStreet !== undefined ? { street: billingStreet } : {}),
+				...(billingZip !== undefined ? { zip: billingZip } : {}),
+				...(billingCity !== undefined ? { city: billingCity } : {}),
+				...(billingCountryCode !== undefined ? { countryCode: billingCountryCode } : {}),
+			}]
+			: existingBillingArr;
+		const shippingArray: Record<string, any>[] = hasShippingFields
+			? [{
+				...(existingShippingArr[0] ?? {}),
+				...(shippingSupplement !== undefined ? { supplement: shippingSupplement } : {}),
+				...(shippingStreet !== undefined ? { street: shippingStreet } : {}),
+				...(shippingZip !== undefined ? { zip: shippingZip } : {}),
+				...(shippingCity !== undefined ? { city: shippingCity } : {}),
+				...(shippingCountryCode !== undefined ? { countryCode: shippingCountryCode } : {}),
+			}]
+			: existingShippingArr;
+
+		// Emails — preserve existing arrays, override specified keys
+		const existingEmails: Record<string, any> = existing.emailAddresses ?? {};
+		const emailAddressesPayload: Record<string, any> = {
+			...existingEmails,
+			...(emailBusiness !== undefined ? { business: [emailBusiness] } : {}),
+			...(emailOffice !== undefined ? { office: [emailOffice] } : {}),
+			...(emailPrivate !== undefined ? { private: [emailPrivate] } : {}),
+			...(emailOther !== undefined ? { other: [emailOther] } : {}),
+		};
+
+		// Phones — preserve existing arrays, override specified keys
+		const existingPhones: Record<string, any> = existing.phoneNumbers ?? {};
+		const phoneNumbersPayload: Record<string, any> = {
+			...existingPhones,
+			...(phoneBusiness !== undefined ? { business: [phoneBusiness] } : {}),
+			...(phoneOffice !== undefined ? { office: [phoneOffice] } : {}),
+			...(phoneMobile !== undefined ? { mobile: [phoneMobile] } : {}),
+			...(phonePrivate !== undefined ? { private: [phonePrivate] } : {}),
+			...(phoneFax !== undefined ? { fax: [phoneFax] } : {}),
+			...(phoneOther !== undefined ? { other: [phoneOther] } : {}),
+		};
+
+		// Company — preserve existing fields, merge updates
+		const existingCompany: Record<string, any> = existing.company ?? {};
+		const companyPayload: Record<string, any> | undefined =
+			companyName !== undefined || existing.company
+				? {
+					...existingCompany,
+					...(companyName !== undefined ? { name: companyName } : {}),
+					...(taxNumber !== undefined ? { taxNumber } : {}),
+					...(vatRegistrationId !== undefined ? { vatRegistrationId } : {}),
+					...(allowTaxFreeInvoices !== undefined ? { allowTaxFreeInvoices } : {}),
+					...(contactPersons !== undefined ? { contactPersons } : {}),
+				}
+				: undefined;
+
+		// Person — preserve existing fields, merge updates
+		const existingPerson: Record<string, any> = existing.person ?? {};
+		const personPayload: Record<string, any> | undefined =
+			firstName !== undefined || lastName !== undefined || salutation !== undefined || existing.person
+				? {
+					...existingPerson,
+					...(salutation !== undefined ? { salutation } : {}),
+					...(firstName !== undefined ? { firstName } : {}),
+					...(lastName !== undefined ? { lastName } : {}),
+				}
+				: undefined;
+
 		const result = await makeLexwareOfficeWriteRequest<any>(`/v1/contacts/${id}`, 'PUT', {
 			version,
 			roles: apiRoles,
-			...(companyName
-				? { company: { name: companyName, ...(taxNumber ? { taxNumber } : {}), ...(vatRegistrationId ? { vatRegistrationId } : {}) } }
-				: {}),
-			...(lastName || firstName ? { person: { ...(salutation ? { salutation } : {}), ...(firstName ? { firstName } : {}), ...(lastName ? { lastName } : {}) } } : {}),
-			...(note ? { note } : {}),
+			...(companyPayload ? { company: companyPayload } : {}),
+			...(personPayload ? { person: personPayload } : {}),
+			...(note !== undefined ? { note } : (existing.note !== undefined ? { note: existing.note } : {})),
+			addresses: { billing: billingArray, shipping: shippingArray },
+			...(Object.keys(emailAddressesPayload).length > 0 ? { emailAddresses: emailAddressesPayload } : {}),
+			...(Object.keys(phoneNumbersPayload).length > 0 ? { phoneNumbers: phoneNumbersPayload } : {}),
 		});
 
 		if (!result || !result.ok) {
@@ -624,17 +982,40 @@ server.tool(
 	},
 );
 
+const unitPriceSchema = z.object({
+	currency: z.literal('EUR'),
+	netAmount: z.string().describe('Net amount as string, e.g. "9.99"'),
+	taxRatePercentage: z.number().describe('Tax rate, e.g. 19 for 19%'),
+});
+
 const lineItemSchema = z.discriminatedUnion('type', [
 	z.object({
-		type: z.enum(['material', 'service', 'custom']),
-		name: z.string().describe('Line item description'),
+		type: z.literal('material'),
+		id: z.string().uuid().describe('Article ID from Lexware article catalog — required for material type; use get-articles to look up IDs'),
+		name: z.string().describe('Line item name (can override the article name on the document)'),
+		description: z.string().optional().describe('Additional description text shown below the item name on the document'),
 		quantity: z.number().describe('Quantity'),
 		unitName: z.string().describe('Unit name, e.g. "Stunden", "Stück"'),
-		unitPrice: z.object({
-			currency: z.literal('EUR'),
-			netAmount: z.string().describe('Net amount as string, e.g. "9.99"'),
-			taxRatePercentage: z.number().describe('Tax rate, e.g. 19 for 19%'),
-		}),
+		unitPrice: unitPriceSchema,
+		discountPercentage: z.number().min(0).max(100).optional(),
+	}),
+	z.object({
+		type: z.literal('service'),
+		id: z.string().uuid().describe('Service/article ID from Lexware article catalog — required for service type; use get-articles to look up IDs'),
+		name: z.string().describe('Line item name (can override the article name on the document)'),
+		description: z.string().optional().describe('Additional description text shown below the item name on the document'),
+		quantity: z.number().describe('Quantity'),
+		unitName: z.string().describe('Unit name, e.g. "Stunden", "Stück"'),
+		unitPrice: unitPriceSchema,
+		discountPercentage: z.number().min(0).max(100).optional(),
+	}),
+	z.object({
+		type: z.literal('custom'),
+		name: z.string().describe('Line item name/title'),
+		description: z.string().optional().describe('Additional description text shown below the item name on the document'),
+		quantity: z.number().describe('Quantity'),
+		unitName: z.string().describe('Unit name, e.g. "Stunden", "Stück"'),
+		unitPrice: unitPriceSchema,
 		discountPercentage: z.number().min(0).max(100).optional(),
 	}),
 	z.object({
@@ -672,8 +1053,8 @@ const invoiceSchema = {
 	}).describe('Service/delivery conditions — required by Lexoffice API'),
 	paymentConditions: z
 		.object({
-			paymentTermLabel: z.string().optional().describe('Payment term label text shown on the document, e.g. "Zahlungsbedingung: 7 Tage, bis zum 08.04.2026"'),
-			paymentTermLabelLanguage: z.enum(['de', 'en']).optional(),
+			paymentTermLabel: z.string().min(1).optional().describe('Custom payment term label shown on the document. When provided, paymentTermLabelLanguage is also required. Omit to let Lexoffice generate the default label from paymentTermDuration.'),
+			paymentTermLabelLanguage: z.enum(['de', 'en']).optional().describe('Language for the paymentTermLabel — required when paymentTermLabel is set'),
 			paymentTermDuration: z.number().int().describe('Payment term in days'),
 			paymentDiscountConditions: z
 				.object({
@@ -794,7 +1175,7 @@ server.tool(
 
 server.tool(
 	'get-dunnings',
-	'Helper for an API limitation: Lexware Office does not support listing dunnings. Use get-dunning-details with a known dunning ID instead. Dunning IDs can be found in the relatedVouchers field of an invoice (get-invoice-details).',
+	'Note: The Lexware Office API does not support listing dunnings. Use get-dunning-details with a known dunning ID instead. Dunning IDs can be found in the relatedVouchers field of an invoice (get-invoice-details).',
 	{},
 	async () => {
 		return {
@@ -827,7 +1208,7 @@ server.tool(
 
 server.tool(
 	'create-voucher',
-	'Create a new bookkeeping voucher (Buchungsbeleg) in Lexware Office, e.g. an incoming invoice (Eingangsrechnung). Use list-posting-categories to find valid categoryId values.',
+	'Create a new bookkeeping voucher (Buchungsbeleg) in Lexware Office. Set voucherStatus: "open" to finalize immediately; omit for unchecked (default). Use list-posting-categories for valid categoryId values. §13b Reverse Charge (Drittland/non-EU supplier): use taxType: "vatfree", taxRatePercent: 19, taxAmount: 0 — §13b-specific posting categories (splitAllowed: false) have undocumented validation rules and may reject; use a standard equivalent category until confirmed.',
 	{
 		type: z
 			.enum(['purchaseinvoice', 'purchasecreditnote', 'salesinvoice', 'salescreditnote'])
@@ -855,6 +1236,7 @@ server.tool(
 				}),
 			)
 			.min(1),
+		voucherStatus: z.enum(['unchecked', 'open']).optional().describe("Set the voucher status. 'open' finalizes immediately. Omit to create as 'unchecked'."),
 	},
 	async (params) => {
 		const totalGrossAmount = params.voucherItems.reduce((sum, item) => sum + item.amount, 0);
@@ -882,7 +1264,7 @@ server.tool(
 
 server.tool(
 	'update-voucher',
-	'Update an existing bookkeeping voucher in Lexware Office. Requires the current version number (get it from get-voucher-details). All fields from create-voucher are required.',
+	'Update an existing bookkeeping voucher in Lexware Office. Requires the current version number (get it from get-voucher-details). Set voucherStatus: "open" to finalize (unchecked → open). File attachments are preserved automatically. §13b Reverse Charge (Drittland/non-EU supplier): use taxType: "vatfree", taxRatePercent: 19, taxAmount: 0 — §13b-specific posting categories (splitAllowed: false) have undocumented validation rules and may reject; use a standard equivalent category until confirmed.',
 	{
 		id: z.string().uuid().describe('The ID of the voucher to update'),
 		version: z.number().int().describe('Current version of the voucher (for optimistic locking)'),
@@ -903,8 +1285,19 @@ server.tool(
 				}),
 			)
 			.min(1),
+		voucherStatus: z.enum(['unchecked', 'open']).optional().describe("Set the voucher status. 'open' finalizes the voucher (unchecked → open)."),
 	},
 	async ({ id, ...body }) => {
+		const LEXOFFICE_API_BASE = 'https://api.lexware.io';
+		const LEXWARE_OFFICE_API_KEY = process.env.LEXWARE_OFFICE_API_KEY!;
+
+		// Save file IDs before PUT — Lexware API silently drops all attachments on PUT
+		const currentVoucher = await makeLexwareOfficeRequest<any>(`/v1/vouchers/${id}`);
+		if (!currentVoucher) {
+			return { content: [{ type: 'text', text: 'Failed to fetch current voucher before update — aborting to prevent file loss. Check connectivity and try again.' }] };
+		}
+		const savedFileIds: string[] = Array.isArray(currentVoucher.files) ? currentVoucher.files : [];
+
 		const totalGrossAmount = body.voucherItems.reduce((sum, item) => sum + item.amount, 0);
 		const totalTaxAmount = body.voucherItems.reduce((sum, item) => sum + item.taxAmount, 0);
 		const result = await makeLexwareOfficeWriteRequest<any>(`/v1/vouchers/${id}`, 'PUT', {
@@ -917,11 +1310,47 @@ server.tool(
 			return { content: [{ type: 'text', text: writeErrorResponse(result && !result.ok ? result : null) }] };
 		}
 
+		// Re-attach files that were present before the PUT
+		const reattachWarnings: string[] = [];
+		for (const fileId of savedFileIds) {
+			try {
+				// Raw fetch: makeLexwareOfficeFileRequest type-constrains Accept to PDF/XML and is
+				// designed for the get-file MCP response path, not for internal file transfers.
+				const downloadResponse = await fetch(`${LEXOFFICE_API_BASE}/v1/files/${fileId}`, {
+					headers: {
+						'Accept': '*/*',
+						'Authorization': `Bearer ${LEXWARE_OFFICE_API_KEY}`,
+					},
+				});
+				if (!downloadResponse.ok) {
+					reattachWarnings.push(`${fileId} (download failed: ${downloadResponse.status})`);
+					continue;
+				}
+				const contentType = downloadResponse.headers.get('content-type') ?? 'application/pdf';
+				const contentDisposition = downloadResponse.headers.get('content-disposition') ?? '';
+				const filename = contentDisposition.match(/filename="?([^";\n]+)"?/)?.[1] ?? `${fileId}.pdf`;
+				const fileBuffer = await downloadResponse.arrayBuffer();
+				const blob = new Blob([fileBuffer], { type: contentType });
+				const formData = new FormData();
+				formData.append('file', blob, filename);
+				const uploadResult = await makeLexwareOfficeMultipartRequest<any>(`/v1/vouchers/${id}/files`, formData);
+				if (!uploadResult || !uploadResult.ok) {
+					reattachWarnings.push(`${fileId} (upload failed)`);
+				}
+			} catch {
+				reattachWarnings.push(`${fileId} (error)`);
+			}
+		}
+
+		const warningText = reattachWarnings.length > 0
+			? `\n\nWarning: could not re-attach file(s): ${reattachWarnings.join(', ')} — re-attach manually using upload-file-to-voucher.`
+			: '';
+
 		return {
 			content: [
 				{
 					type: 'text',
-					text: `Voucher updated successfully:\n\n${JSON.stringify(result.data, null, 2)}`,
+					text: `Voucher updated successfully:\n\n${JSON.stringify(result.data, null, 2)}${warningText}`,
 				},
 			],
 		};
@@ -1116,6 +1545,37 @@ server.tool(
 
 		return {
 			content: [{ type: 'text', text: `Delivery note details:\n\n${JSON.stringify(data, null, 2)}` }],
+		};
+	},
+);
+
+server.tool(
+	'get-down-payment-invoices',
+	'Get a list of down payment invoices (Anzahlungsrechnungen) from Lexware Office',
+	{
+		status: z
+			.array(z.enum(['draft', 'open', 'paid', 'voided']))
+			.optional()
+			.default(['draft', 'open', 'paid', 'voided']),
+		contactId: z.string().uuid().optional().describe('Filter by contact ID'),
+		page: z.number().min(0).optional().default(0).describe('page number to retrieve; starts at 0'),
+		size: z.number().min(1).max(250).optional().default(250).describe('number of results per page'),
+	},
+	async ({ status, contactId, page, size }) => {
+		let url = `/v1/voucherlist?voucherType=downpaymentinvoice&voucherStatus=${status.join(',')}&page=${page}&size=${size}`;
+		if (contactId) url += `&contactId=${contactId}`;
+		const data = await makeLexwareOfficeRequest<any>(url);
+		const vouchers = data?.content;
+
+		if (!vouchers || vouchers.length === 0) {
+			return { content: [{ type: 'text', text: 'No down payment invoices found' }] };
+		}
+
+		return {
+			content: [{
+				type: 'text',
+				text: `There are ${data.totalElements} down payment invoices in total (showing ${vouchers.length} on page ${page}):\n\n${JSON.stringify(vouchers, null, 2)}`,
+			}],
 		};
 	},
 );
@@ -1376,8 +1836,25 @@ server.tool(
 
 const deliveryNoteLineItemSchema = z.discriminatedUnion('type', [
 	z.object({
-		type: z.enum(['material', 'service', 'custom']),
-		name: z.string().describe('Line item description'),
+		type: z.literal('material'),
+		id: z.string().uuid().describe('Article ID from Lexware article catalog — required for material type'),
+		name: z.string().describe('Line item name'),
+		description: z.string().optional().describe('Additional description text shown below the item name'),
+		quantity: z.number().describe('Quantity'),
+		unitName: z.string().describe('Unit name, e.g. "Stück", "kg"'),
+	}),
+	z.object({
+		type: z.literal('service'),
+		id: z.string().uuid().describe('Service/article ID from Lexware article catalog — required for service type'),
+		name: z.string().describe('Line item name'),
+		description: z.string().optional().describe('Additional description text shown below the item name'),
+		quantity: z.number().describe('Quantity'),
+		unitName: z.string().describe('Unit name, e.g. "Stück", "kg"'),
+	}),
+	z.object({
+		type: z.literal('custom'),
+		name: z.string().describe('Line item name'),
+		description: z.string().optional().describe('Additional description text shown below the item name'),
 		quantity: z.number().describe('Quantity'),
 		unitName: z.string().describe('Unit name, e.g. "Stück", "kg"'),
 	}),
@@ -1634,21 +2111,32 @@ server.tool(
 	},
 );
 
+function resolveMimeType(filePath: string): string {
+	const ext = extname(filePath).toLowerCase();
+	const map: Record<string, string> = {
+		'.pdf': 'application/pdf',
+		'.jpg': 'image/jpeg',
+		'.jpeg': 'image/jpeg',
+		'.png': 'image/png',
+		'.xml': 'application/xml',
+	};
+	const mime = map[ext];
+	if (!mime) throw new Error(`Unsupported file extension "${ext}". Supported: .pdf, .jpg, .jpeg, .png, .xml`);
+	return mime;
+}
+
 server.tool(
 	'upload-file',
 	'Upload a file (PDF, JPG, PNG, or XML) to Lexware Office for bookkeeping purposes. Returns a file ID. Max file size: 5 MB. For XML (e-invoice), the "E-Rechnung" feature must be enabled in Lexware Office settings.',
 	{
-		fileContentBase64: z.string().describe('Base64-encoded file content'),
-		fileName: z.string().describe('File name including extension, e.g. "rechnung.pdf"'),
-		mimeType: z
-			.enum(['application/pdf', 'image/jpeg', 'image/png', 'application/xml'])
-			.describe('MIME type of the file'),
+		filePath: z.string().describe('Absolute path to the file on the server (max 5 MB). Supported: .pdf, .jpg, .jpeg, .png, .xml'),
 	},
-	async ({ fileContentBase64, fileName, mimeType }) => {
-		const fileBuffer = Buffer.from(fileContentBase64, 'base64');
+	async ({ filePath }) => {
+		const mimeType = resolveMimeType(filePath);
+		const fileBuffer = readFileSync(filePath);
 		const blob = new Blob([fileBuffer], { type: mimeType });
 		const formData = new FormData();
-		formData.append('file', blob, fileName);
+		formData.append('file', blob, basename(filePath));
 		formData.append('type', 'voucher');
 
 		const result = await makeLexwareOfficeMultipartRequest<any>('/v1/files', formData);
@@ -1668,17 +2156,14 @@ server.tool(
 	'Upload and assign a file (PDF, JPG, PNG, or XML) directly to an existing voucher (Beleg) in Lexware Office. Use this to attach a receipt image or invoice PDF to a bookkeeping entry.',
 	{
 		voucherId: z.string().uuid().describe('The ID of the voucher to attach the file to'),
-		fileContentBase64: z.string().describe('Base64-encoded file content'),
-		fileName: z.string().describe('File name including extension, e.g. "beleg.pdf"'),
-		mimeType: z
-			.enum(['application/pdf', 'image/jpeg', 'image/png', 'application/xml'])
-			.describe('MIME type of the file'),
+		filePath: z.string().describe('Absolute path to the file on the server (max 5 MB). Supported: .pdf, .jpg, .jpeg, .png, .xml'),
 	},
-	async ({ voucherId, fileContentBase64, fileName, mimeType }) => {
-		const fileBuffer = Buffer.from(fileContentBase64, 'base64');
+	async ({ voucherId, filePath }) => {
+		const mimeType = resolveMimeType(filePath);
+		const fileBuffer = readFileSync(filePath);
 		const blob = new Blob([fileBuffer], { type: mimeType });
 		const formData = new FormData();
-		formData.append('file', blob, fileName);
+		formData.append('file', blob, basename(filePath));
 
 		const result = await makeLexwareOfficeMultipartRequest<any>(`/v1/vouchers/${voucherId}/files`, formData);
 
