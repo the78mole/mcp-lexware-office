@@ -1289,6 +1289,13 @@ server.tool(
 		voucherStatus: z.enum(['unchecked', 'open']).optional().describe("Set the voucher status. 'open' finalizes the voucher (unchecked → open)."),
 	},
 	async ({ id, ...body }) => {
+		const LEXOFFICE_API_BASE = 'https://api.lexware.io';
+		const LEXWARE_OFFICE_API_KEY = process.env.LEXWARE_OFFICE_API_KEY!;
+
+		// Save file IDs before PUT — Lexware API silently drops all attachments on PUT
+		const currentVoucher = await makeLexwareOfficeRequest<any>(`/v1/vouchers/${id}`);
+		const savedFileIds: string[] = Array.isArray(currentVoucher?.files) ? currentVoucher.files : [];
+
 		const totalGrossAmount = body.voucherItems.reduce((sum, item) => sum + item.amount, 0);
 		const totalTaxAmount = body.voucherItems.reduce((sum, item) => sum + item.taxAmount, 0);
 		const result = await makeLexwareOfficeWriteRequest<any>(`/v1/vouchers/${id}`, 'PUT', {
@@ -1301,11 +1308,47 @@ server.tool(
 			return { content: [{ type: 'text', text: writeErrorResponse(result && !result.ok ? result : null) }] };
 		}
 
+		// Re-attach files that were present before the PUT
+		const reattachWarnings: string[] = [];
+		for (const fileId of savedFileIds) {
+			try {
+				// Raw fetch: makeLexwareOfficeFileRequest type-constrains Accept to PDF/XML and is
+				// designed for the get-file MCP response path, not for internal file transfers.
+				const downloadResponse = await fetch(`${LEXOFFICE_API_BASE}/v1/files/${fileId}`, {
+					headers: {
+						'Accept': '*/*',
+						'Authorization': `Bearer ${LEXWARE_OFFICE_API_KEY}`,
+					},
+				});
+				if (!downloadResponse.ok) {
+					reattachWarnings.push(`${fileId} (download failed: ${downloadResponse.status})`);
+					continue;
+				}
+				const contentType = downloadResponse.headers.get('content-type') ?? 'application/pdf';
+				const contentDisposition = downloadResponse.headers.get('content-disposition') ?? '';
+				const filename = contentDisposition.match(/filename="?([^";\n]+)"?/)?.[1] ?? `${fileId}.pdf`;
+				const fileBuffer = await downloadResponse.arrayBuffer();
+				const blob = new Blob([fileBuffer], { type: contentType });
+				const formData = new FormData();
+				formData.append('file', blob, filename);
+				const uploadResult = await makeLexwareOfficeMultipartRequest<any>(`/v1/vouchers/${id}/files`, formData);
+				if (!uploadResult || !uploadResult.ok) {
+					reattachWarnings.push(`${fileId} (upload failed)`);
+				}
+			} catch {
+				reattachWarnings.push(`${fileId} (error)`);
+			}
+		}
+
+		const warningText = reattachWarnings.length > 0
+			? `\n\nWarning: could not re-attach file(s): ${reattachWarnings.join(', ')} — re-attach manually using upload-file-to-voucher.`
+			: '';
+
 		return {
 			content: [
 				{
 					type: 'text',
-					text: `Voucher updated successfully:\n\n${JSON.stringify(result.data, null, 2)}`,
+					text: `Voucher updated successfully:\n\n${JSON.stringify(result.data, null, 2)}${warningText}`,
 				},
 			],
 		};
