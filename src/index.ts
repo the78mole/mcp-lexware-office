@@ -592,9 +592,8 @@ server.tool(
 		id: z.string().uuid().describe('The ID of the invoice or voucher to retrieve payment information for'),
 	},
 	async ({ id }) => {
-		const LEXOFFICE_API_BASE = 'https://api.lexoffice.io';
 		const LEXWARE_OFFICE_API_KEY = process.env.LEXWARE_OFFICE_API_KEY!;
-		const response = await fetch(`${LEXOFFICE_API_BASE}/v1/payments/${id}`, {
+		const response = await fetch(`https://api.lexware.io/v1/payments/${id}`, {
 			headers: {
 				Accept: 'application/json',
 				Authorization: `Bearer ${LEXWARE_OFFICE_API_KEY}`,
@@ -1294,7 +1293,10 @@ server.tool(
 
 		// Save file IDs before PUT — Lexware API silently drops all attachments on PUT
 		const currentVoucher = await makeLexwareOfficeRequest<any>(`/v1/vouchers/${id}`);
-		const savedFileIds: string[] = Array.isArray(currentVoucher?.files) ? currentVoucher.files : [];
+		if (!currentVoucher) {
+			return { content: [{ type: 'text', text: 'Failed to fetch current voucher before update — aborting to prevent file loss. Check connectivity and try again.' }] };
+		}
+		const savedFileIds: string[] = Array.isArray(currentVoucher.files) ? currentVoucher.files : [];
 
 		const totalGrossAmount = body.voucherItems.reduce((sum, item) => sum + item.amount, 0);
 		const totalTaxAmount = body.voucherItems.reduce((sum, item) => sum + item.taxAmount, 0);
