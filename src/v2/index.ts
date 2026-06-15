@@ -15,7 +15,9 @@ const server = new McpServer({
 
 const searchExecutor = new QuickJsExecutor();
 const executeExecutor = new QuickJsExecutor();
-const lexwareClient = new LexwareApiClient();
+// Use a shorter per-request timeout than the executor timeout (30 s) so that
+// slow Lexware requests fail with a clean error before the sandbox is torn down.
+const lexwareClient = new LexwareApiClient({ requestTimeoutMs: 25_000 });
 
 server.tool(
 	'search',

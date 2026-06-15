@@ -175,6 +175,48 @@ test('large valid JSON reference response (like /v1/countries) is parsed into re
 	assert.equal(Object.prototype.hasOwnProperty.call(response, 'truncated'), false, 'res.truncated must be absent for parsed JSON');
 });
 
+test('binary response with Content-Length returns metadata without consuming the body', async () => {
+	let arrayBufferCalled = false;
+	const fetchImpl: typeof fetch = async () => {
+		const resp = new Response(new Uint8Array([1, 2, 3, 4, 5]), {
+			status: 200,
+			headers: { 'content-type': 'application/pdf', 'content-length': '5' },
+		});
+		// Override arrayBuffer to detect if the body is fully buffered
+		const origArrayBuffer = resp.arrayBuffer.bind(resp);
+		Object.defineProperty(resp, 'arrayBuffer', {
+			value: () => { arrayBufferCalled = true; return origArrayBuffer(); },
+		});
+		return resp;
+	};
+
+	const response = await clientWithFetch(fetchImpl).request({ path: '/v1/files/abc', accept: 'application/pdf' });
+
+	assert.equal(arrayBufferCalled, false, 'arrayBuffer must not be called when Content-Length is present');
+	assert.deepEqual(response.data, { binary: true, contentType: 'application/pdf', bytes: 5, bytesSource: 'content-length', omitted: true });
+});
+
+test('binary response without Content-Length returns compact metadata with bytesUnknown', async () => {
+	const fetchImpl: typeof fetch = async () => responseFor(200, new Uint8Array([1, 2, 3]), { 'content-type': 'application/octet-stream' });
+
+	const response = await clientWithFetch(fetchImpl).request({ path: '/v1/files/abc', accept: 'application/octet-stream' });
+
+	assert.deepEqual(response.data, { binary: true, contentType: 'application/octet-stream', omitted: true, bytesUnknown: true });
+	assert.equal(Object.prototype.hasOwnProperty.call(response.data, 'bytes'), false);
+});
+
+test('JSON and text response parsing is unchanged by the binary optimisation', async () => {
+	const jsonFetch: typeof fetch = async () => responseFor(200, JSON.stringify({ id: 'abc', name: 'Test' }), { 'content-type': 'application/json' });
+	const jsonResponse = await clientWithFetch(jsonFetch).request({ path: '/v1/contacts/abc' });
+	assert.deepEqual(jsonResponse.data, { id: 'abc', name: 'Test' });
+	assert.equal(Object.prototype.hasOwnProperty.call(jsonResponse, 'text'), false);
+
+	const textFetch: typeof fetch = async () => responseFor(200, 'hello world', { 'content-type': 'text/plain' });
+	const textResponse = await clientWithFetch(textFetch).request({ path: '/v1/custom', accept: 'text/plain' });
+	assert.equal(textResponse.text, 'hello world');
+	assert.equal(Object.prototype.hasOwnProperty.call(textResponse, 'data'), false);
+});
+
 test('large valid JSON with UTF-8 BOM is parsed into res.data (BOM regression)', async () => {
 	// Reproduce the observed live-testing failure: API returns application/json with a
 	// leading UTF-8 BOM (﻿). JSON.parse rejects the BOM, causing the response to

@@ -1,4 +1,4 @@
-import { getQuickJS, shouldInterruptAfterDeadline } from 'quickjs-emscripten';
+import { getQuickJS, shouldInterruptAfterDeadline, type QuickJSDeferredPromise } from 'quickjs-emscripten';
 
 export interface CodeExecutor {
 	execute(
@@ -54,28 +54,64 @@ export class QuickJsExecutor implements CodeExecutor {
 		runtime.setMaxStackSize(maxStackSizeBytes);
 		runtime.setInterruptHandler(shouldInterruptAfterDeadline(Date.now() + timeoutMs));
 
+		// Track every QuickJS deferred promise created by host functions.
+		// We must settle (reject) all unsettled deferreds before disposing the VM/runtime;
+		// otherwise the resolveHandle/rejectHandle remain live in QuickJS's GC list and
+		// JS_FreeRuntime aborts the process with an assertion failure.
+		const unsettledDeferreds = new Set<QuickJSDeferredPromise>();
+
+		// Signals whether the VM has been torn down; host callbacks must not touch
+		// VM handles after this is set to true.
+		let vmDisposed = false;
+
+		// The native-side promise that mirrors the top-level QuickJS async IIFE.
+		// We track it here so the finally block can await its settlement after
+		// forcing all pending deferreds to settle, which allows QuickJS to drain
+		// its own continuation queue before we dispose.
+		let sandboxNativePromise: Promise<unknown> | undefined;
+
+		// In-flight host call Node.js promises. We wait for them in finally so
+		// we don't dispose the VM while a callback is mid-flight.
+		const pendingHostCalls = new Set<Promise<void>>();
+
 		try {
 			for (const [name, handler] of Object.entries(options.hostFunctions ?? {})) {
 				vm.newFunction(name, (payloadHandle) => {
 					const payload = vm.getString(payloadHandle);
 					const deferred = vm.newPromise();
+					unsettledDeferreds.add(deferred);
+
+					let resolveTracked!: () => void;
+					const tracked = new Promise<void>((res) => { resolveTracked = res; });
+					pendingHostCalls.add(tracked);
+
 					handler(payload)
 						.then(
 							(result) => {
-								const resultHandle = vm.newString(result);
-								deferred.resolve(resultHandle);
-								resultHandle.dispose();
+								if (!vmDisposed) {
+									unsettledDeferreds.delete(deferred);
+									const resultHandle = vm.newString(result);
+									deferred.resolve(resultHandle);
+									resultHandle.dispose();
+									runtime.executePendingJobs();
+								}
 							},
 							(error) => {
-								const errorHandle = vm.newError({ name: 'Error', message: stringifyHostError(error) });
-								deferred.reject(errorHandle);
-								errorHandle.dispose();
+								if (!vmDisposed) {
+									unsettledDeferreds.delete(deferred);
+									const errorHandle = vm.newError({ name: 'Error', message: stringifyHostError(error) });
+									deferred.reject(errorHandle);
+									errorHandle.dispose();
+									runtime.executePendingJobs();
+								}
 							},
 						)
-						.catch(() => undefined);
-					deferred.settled
-						.then(() => runtime.executePendingJobs())
-						.catch(() => undefined);
+						.finally(() => {
+							pendingHostCalls.delete(tracked);
+							resolveTracked();
+						});
+
+					// Return the handle; quickjs-emscripten takes ownership and disposes it.
 					return deferred.handle;
 				}).consume((hostFunctionHandle) => {
 					vm.setProp(vm.global, name, hostFunctionHandle);
@@ -152,18 +188,28 @@ export class QuickJsExecutor implements CodeExecutor {
           }
           return { found: true, value: current };
         };
+        const decimalStringPattern = /^[+-]?(?:\\d+\\.?\\d*|\\.\\d+)$/;
         const requireNumber = (row, fieldPath) => {
           const result = getPathValue(row, fieldPath);
           if (!result.found) {
             throw new Error("Missing expected field " + fieldPath + ". Available fields: " + result.availableFields);
           }
-          const value = Number(result.value);
-          if (!Number.isFinite(value)) {
-            throw new Error("Expected numeric " + fieldPath + ", got " + JSON.stringify(result.value));
+          const raw = result.value;
+          if (typeof raw === "number") {
+            if (!Number.isFinite(raw)) {
+              throw new Error("Expected numeric " + fieldPath + ", got " + JSON.stringify(raw));
+            }
+            return raw;
           }
-          return value;
+          if (typeof raw === "string") {
+            const trimmed = raw.trim();
+            if (trimmed.length === 0 || !decimalStringPattern.test(trimmed)) {
+              throw new Error("Expected numeric " + fieldPath + ", got " + JSON.stringify(raw));
+            }
+            return Number(trimmed);
+          }
+          throw new Error("Expected numeric " + fieldPath + ", got " + JSON.stringify(raw));
         };
-        const decimalStringPattern = /^[+-]?(?:\\d+\\.?\\d*|\\.\\d+)$/;
         const decimalStringToCents = (input) => {
           const trimmed = input.trim();
           const sign = trimmed[0] === "-" ? -1 : 1;
@@ -285,6 +331,7 @@ export class QuickJsExecutor implements CodeExecutor {
 			let resolved;
 			try {
 				const nativePromise = vm.resolvePromise(promiseHandle);
+				sandboxNativePromise = nativePromise;
 				const pendingJobsResult = runtime.executePendingJobs();
 				if (pendingJobsResult.error) {
 					const error = stringifyQuickJsError(vm.dump(pendingJobsResult.error));
@@ -293,6 +340,7 @@ export class QuickJsExecutor implements CodeExecutor {
 					return { error, logs };
 				}
 				resolved = await withTimeout(nativePromise, timeoutMs);
+				sandboxNativePromise = undefined;
 				promiseHandle.dispose();
 			} catch (error) {
 				promiseHandle.dispose();
@@ -309,6 +357,46 @@ export class QuickJsExecutor implements CodeExecutor {
 			resolved.value.dispose();
 			return { result, logs };
 		} finally {
+			// Signal host callbacks not to touch the VM anymore.
+			vmDisposed = true;
+
+			// Reject every unsettled QuickJS deferred. Without this, the resolveHandle /
+			// rejectHandle inside each deferred remain live in QuickJS's GC list and
+			// JS_FreeRuntime asserts list_empty(&rt->gc_obj_list), crashing the process.
+			if (unsettledDeferreds.size > 0) {
+				const shutdownError = vm.newError('Sandbox VM is shutting down');
+				for (const deferred of unsettledDeferreds) {
+					try { deferred.reject(shutdownError); } catch { /* already settled */ }
+				}
+				shutdownError.dispose();
+				unsettledDeferreds.clear();
+				runtime.executePendingJobs();
+			}
+
+			// If the sandbox native promise is still pending (i.e. we timed out while
+			// the sandbox was awaiting a host call), drain it now that we've settled the
+			// deferreds. This lets QuickJS process its continuation callbacks before we
+			// free the runtime, avoiding another source of gc_obj_list assertion failures.
+			if (sandboxNativePromise !== undefined) {
+				const results = await Promise.allSettled([sandboxNativePromise]);
+				// Dispose any QuickJS handles returned by the resolved native promise.
+				for (const r of results) {
+					if (r.status === 'fulfilled') {
+						const val = r.value as { error?: { dispose(): void }; value?: { dispose(): void } } | undefined;
+						try { val?.error?.dispose(); } catch { /* ignore */ }
+						try { val?.value?.dispose(); } catch { /* ignore */ }
+					}
+				}
+				sandboxNativePromise = undefined;
+			}
+
+			// Wait for any in-flight Node.js host call promises to finish (they will not
+			// touch the VM because vmDisposed is true, but we still need the microtask
+			// queue to drain before we free the runtime).
+			if (pendingHostCalls.size > 0) {
+				await Promise.allSettled(pendingHostCalls);
+			}
+
 			vm.dispose();
 			runtime.dispose();
 		}

@@ -76,6 +76,79 @@ test('lexware money helpers sum integer cents and format stable strings', async 
 	});
 });
 
+test('lexware.requireNumber rejects null, empty string, whitespace, booleans', async () => {
+	const execution = await executeWithLexware(`async () => {
+		const capture = (fn) => {
+			try {
+				fn();
+				return 'no error';
+			} catch (error) {
+				return error.message;
+			}
+		};
+		return {
+			nullValue: capture(() => lexware.requireNumber({ amount: null }, 'amount')),
+			emptyString: capture(() => lexware.requireNumber({ amount: '' }, 'amount')),
+			whitespace: capture(() => lexware.requireNumber({ amount: '  ' }, 'amount')),
+			boolFalse: capture(() => lexware.requireNumber({ amount: false }, 'amount')),
+			boolTrue: capture(() => lexware.requireNumber({ amount: true }, 'amount')),
+		};
+	}`);
+
+	assert.equal(execution.error, undefined);
+	const r = execution.result as Record<string, string>;
+	assert.match(r.nullValue, /Expected numeric amount/);
+	assert.match(r.emptyString, /Expected numeric amount/);
+	assert.match(r.whitespace, /Expected numeric amount/);
+	assert.match(r.boolFalse, /Expected numeric amount/);
+	assert.match(r.boolTrue, /Expected numeric amount/);
+});
+
+test('lexware.requireNumber accepts valid numeric and decimal-string values', async () => {
+	const execution = await executeWithLexware(`async () => ({
+		zero: lexware.requireNumber({ amount: 0 }, 'amount'),
+		posDecimal: lexware.requireNumber({ amount: 12.34 }, 'amount'),
+		stringDecimal: lexware.requireNumber({ amount: '12.34' }, 'amount'),
+		negString: lexware.requireNumber({ amount: '-12.34' }, 'amount'),
+		dotOnly: lexware.requireNumber({ amount: '.99' }, 'amount'),
+		zeroString: lexware.requireNumber({ amount: '0.00' }, 'amount'),
+	})`);
+
+	assert.equal(execution.error, undefined);
+	assert.deepEqual(execution.result, {
+		zero: 0,
+		posDecimal: 12.34,
+		stringDecimal: 12.34,
+		negString: -12.34,
+		dotOnly: 0.99,
+		zeroString: 0,
+	});
+});
+
+test('lexware.requireMoney rejects null, empty string, and booleans', async () => {
+	const execution = await executeWithLexware(`async () => {
+		const capture = (fn) => {
+			try {
+				fn();
+				return 'no error';
+			} catch (error) {
+				return error.message;
+			}
+		};
+		return {
+			nullValue: capture(() => lexware.requireMoney({ amount: null }, 'amount')),
+			emptyString: capture(() => lexware.requireMoney({ amount: '' }, 'amount')),
+			boolFalse: capture(() => lexware.requireMoney({ amount: false }, 'amount')),
+		};
+	}`);
+
+	assert.equal(execution.error, undefined);
+	const r = execution.result as Record<string, string>;
+	assert.match(r.nullValue, /Expected numeric amount/);
+	assert.match(r.emptyString, /Expected numeric amount/);
+	assert.match(r.boolFalse, /Expected numeric amount/);
+});
+
 test('lexware helpers are only available when the execute host function exists', async () => {
 	const executeMode = await executeWithLexware(`async () => ({
 		lexwareType: typeof lexware,

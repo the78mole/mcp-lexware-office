@@ -329,16 +329,14 @@ async function parseResponse(response: Response, request: NormalizedRequest, max
 
 	const isTextual = isTextualResponse(contentType, request.accept);
 	if (!isTextual) {
-		const bytes = await response.arrayBuffer();
-		return {
-			...base,
-			data: {
-				binary: true,
-				contentType: contentType || 'application/octet-stream',
-				bytes: bytes.byteLength,
-				omitted: true,
-			},
-		};
+		// Avoid buffering the full binary body — use Content-Length if available.
+		response.body?.cancel();
+		const contentLengthHeader = response.headers.get('content-length');
+		const contentLengthBytes = contentLengthHeader !== null ? Number(contentLengthHeader) : NaN;
+		const binaryMeta = Number.isFinite(contentLengthBytes) && contentLengthBytes >= 0
+			? { binary: true, contentType: contentType || 'application/octet-stream', bytes: contentLengthBytes, bytesSource: 'content-length' as const, omitted: true }
+			: { binary: true, contentType: contentType || 'application/octet-stream', omitted: true, bytesUnknown: true };
+		return { ...base, data: binaryMeta };
 	}
 
 	const rawText = await response.text();

@@ -167,13 +167,13 @@ test('text, binary metadata, and truncation recovery guidance are returned compa
 	const text = await textClient.request({ path: '/v1/custom-text', accept: 'text/plain' });
 	assert.equal(text.text, 'plain text');
 
-	const binaryClient = clientWithCalls(async () => responseFor(200, new Uint8Array([1, 2, 3]), { 'content-type': 'application/pdf' }, 'OK')).client;
+	const binaryClient = clientWithCalls(async () => responseFor(200, new Uint8Array([1, 2, 3]), { 'content-type': 'application/pdf', 'content-length': '3' }, 'OK')).client;
 	const binary = await binaryClient.request({ path: '/v1/files/file-id', accept: 'application/pdf' });
-	assert.deepEqual(binary.data, { binary: true, contentType: 'application/pdf', bytes: 3, omitted: true });
+	assert.deepEqual(binary.data, { binary: true, contentType: 'application/pdf', bytes: 3, bytesSource: 'content-length', omitted: true });
 
-	const defaultAcceptBinaryClient = clientWithCalls(async () => responseFor(200, new Uint8Array([1, 2, 3]), { 'content-type': 'application/pdf' }, 'OK')).client;
+	const defaultAcceptBinaryClient = clientWithCalls(async () => responseFor(200, new Uint8Array([1, 2, 3]), { 'content-type': 'application/pdf', 'content-length': '3' }, 'OK')).client;
 	const defaultAcceptBinary = await defaultAcceptBinaryClient.request({ path: '/v1/files/file-id' });
-	assert.deepEqual(defaultAcceptBinary.data, { binary: true, contentType: 'application/pdf', bytes: 3, omitted: true });
+	assert.deepEqual(defaultAcceptBinary.data, { binary: true, contentType: 'application/pdf', bytes: 3, bytesSource: 'content-length', omitted: true });
 
 	const truncated = truncateText('x'.repeat(50), { maxChars: 10 });
 	assert.match(truncated, /truncated 40 characters/);
