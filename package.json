@@ -1,43 +1,43 @@
 {
-	"name": "mcp-lexware-office",
-	"description": "MCP server to interact with Lexware Office",
-	"version": "1.5.0",
-	"license": "MIT",
-	"author": "Jannik Wempe <jannik@wempe.dev>",
-	"contributors": [
-		"Simon Fieber <https://github.com/si0nDE>"
-	],
-	"keywords": [
-		"mcp",
-		"lexware-office",
-		"lexoffice"
-	],
-	"homepage": "https://github.com/JannikWempe/mcp-lexware-office",
-	"bugs": "https://github.com/JannikWempe/mcp-lexware-office/issues",
-	"type": "module",
-	"bin": {
-		"lexware-office": "./build/index.js",
-		"lexware-office-v2": "./build/v2/index.js"
-	},
-	"files": [
-		"build",
-		"docs"
-	],
-	"scripts": {
-		"build": "shx rm -rf build && tsc && shx chmod +x build/*.js build/v2/*.js",
-		"prepare": "npm run build",
-		"typecheck": "tsc --noEmit",
-		"test": "npm run build && node --test build/v2/*.test.js"
-	},
-	"dependencies": {
-		"@modelcontextprotocol/sdk": "^1.29.0",
-		"quickjs-emscripten": "0.32.0",
-		"zod": "^3.24.2"
-	},
-	"devDependencies": {
-		"@types/node": "^22.13.10",
-		"shx": "^0.3.4",
-		"typescript": "^5.8.2"
-	},
-	"packageManager": "pnpm@10.6.3"
+  "name": "mcp-lexware-office",
+  "description": "MCP server to interact with Lexware Office",
+  "version": "1.6.0",
+  "license": "MIT",
+  "author": "Jannik Wempe <jannik@wempe.dev>",
+  "contributors": [
+    "Simon Fieber <https://github.com/si0nDE>"
+  ],
+  "keywords": [
+    "mcp",
+    "lexware-office",
+    "lexoffice"
+  ],
+  "homepage": "https://github.com/JannikWempe/mcp-lexware-office",
+  "bugs": "https://github.com/JannikWempe/mcp-lexware-office/issues",
+  "type": "module",
+  "bin": {
+    "lexware-office": "./build/index.js",
+    "lexware-office-v2": "./build/v2/index.js"
+  },
+  "files": [
+    "build",
+    "docs"
+  ],
+  "scripts": {
+    "build": "shx rm -rf build && tsc && shx chmod +x build/*.js build/v2/*.js",
+    "prepare": "npm run build",
+    "typecheck": "tsc --noEmit",
+    "test": "npm run build && node --test build/v2/*.test.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "quickjs-emscripten": "0.32.0",
+    "zod": "^3.24.2"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.10",
+    "shx": "^0.3.4",
+    "typescript": "^5.8.2"
+  },
+  "packageManager": "pnpm@10.6.3"
 }
