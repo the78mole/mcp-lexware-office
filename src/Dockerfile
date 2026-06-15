@@ -1,12 +1,15 @@
 FROM node:22.12-alpine AS builder
 
-# Must be entire project because `prepare` script is run during `npm install` and requires all files.
 COPY . /app
 COPY tsconfig.json /tsconfig.json
 
 WORKDIR /app
 
-RUN --mount=type=cache,target=/root/.npm npm install
+RUN npm install -g pnpm
+
+RUN --mount=type=cache,target=/root/.local/share/pnpm/store pnpm install --ignore-scripts
+
+RUN pnpm run build
 
 FROM node:22-alpine AS release
 
@@ -14,10 +17,10 @@ WORKDIR /app
 
 COPY --from=builder /app/build /app/build
 COPY --from=builder /app/package.json /app/package.json
-COPY --from=builder /app/package-lock.json /app/package-lock.json
+COPY --from=builder /app/pnpm-lock.yaml /app/pnpm-lock.yaml
 
 ENV NODE_ENV=production
 
-RUN npm ci --ignore-scripts --omit-dev
+RUN npm install -g pnpm && pnpm install --prod --ignore-scripts
 
 ENTRYPOINT ["node", "build/index.js"]

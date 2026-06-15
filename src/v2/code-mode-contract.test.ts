@@ -135,10 +135,14 @@ test('JSON, custom content type, and raw body serialization are supported', asyn
 	assert.equal((calls[0]?.init?.headers as Record<string, string>)['Content-Type'], 'application/vnd.lexware+json');
 	assert.equal(calls[0]?.init?.body, JSON.stringify({ name: 'Ada' }));
 
-	const multipart = '--boundary\r\nContent-Disposition: form-data; name="file"; filename="a.txt"\r\n\r\nhello\r\n--boundary--\r\n';
-	await client.request({ method: 'POST', path: '/v1/files', query: { type: 'voucher' }, contentType: 'multipart/form-data; boundary=boundary', rawBody: true, body: multipart });
+	const multipart = '--boundary\r\nContent-Disposition: form-data; name="file"; filename="a.txt"\r\n\r\nhello\r\n--boundary\r\nContent-Disposition: form-data; name="type"\r\n\r\nvoucher\r\n--boundary--\r\n';
+	await client.request({ method: 'POST', path: '/v1/files', contentType: 'multipart/form-data; boundary=boundary', rawBody: true, body: multipart });
 	assert.equal((calls[1]?.init?.headers as Record<string, string>)['Content-Type'], 'multipart/form-data; boundary=boundary');
 	assert.equal(calls[1]?.init?.body, multipart);
+	// type=voucher must be a multipart form field, not a query parameter
+	assert.match(calls[1]?.init?.body as string, /Content-Disposition: form-data; name="file"; filename="[^"]+"/);
+	assert.match(calls[1]?.init?.body as string, /Content-Disposition: form-data; name="type"/);
+	assert.match(calls[1]?.init?.body as string, /\r\nvoucher\r\n/);
 });
 
 test('large JSON responses stay parsed so execute code can summarize them', async () => {

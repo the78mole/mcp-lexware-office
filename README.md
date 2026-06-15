@@ -96,6 +96,17 @@ For v2 preview from GitHub, run the packaged binary. The package builds itself d
 }
 ```
 
+**Troubleshooting:** If the `npx` command above fails during git-dependency preparation with an error mentioning `--before`, your npm user config may contain `minimum-release-age`, which conflicts with npm's internal `--before` flag. Two fixes:
+
+```bash
+# Option 1: bypass your user config for this invocation
+NPM_CONFIG_USERCONFIG=/dev/null \
+  npx -y --package=github:JannikWempe/mcp-lexware-office#v2 lexware-office-v2
+
+# Option 2: remove the conflicting setting permanently
+npm config delete minimum-release-age --location=user
+```
+
 When this package is published to npm, replace the GitHub package spec with the npm package name:
 
 ```json

@@ -341,7 +341,9 @@ async function parseResponse(response: Response, request: NormalizedRequest, max
 		};
 	}
 
-	const text = await response.text();
+	const rawText = await response.text();
+	// Strip UTF-8 BOM (﻿) that some servers prepend; JSON.parse rejects it.
+	const text = rawText.charCodeAt(0) === 0xfeff ? rawText.slice(1) : rawText;
 
 	if (isJsonResponse(contentType, request.accept)) {
 		try {

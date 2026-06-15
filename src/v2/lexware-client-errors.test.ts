@@ -136,3 +136,57 @@ test('timeout errors use sanitized method/path messages', async () => {
 		/Lexware API request timed out after 1ms for GET \/v1\/countries/,
 	);
 });
+
+// Synthetic fixture representing /v1/countries response shape.
+// Non-sensitive public reference data (country codes, names, tax classifications).
+const COUNTRIES_FIXTURE = [
+	{ countryCode: 'DE', countryNameEN: 'Germany', countryNameDE: 'Deutschland', taxClassification: 'intraCommunity' },
+	{ countryCode: 'AT', countryNameEN: 'Austria', countryNameDE: 'Österreich', taxClassification: 'intraCommunity' },
+	{ countryCode: 'FR', countryNameEN: 'France', countryNameDE: 'Frankreich', taxClassification: 'intraCommunity' },
+	{ countryCode: 'US', countryNameEN: 'United States', countryNameDE: 'Vereinigte Staaten', taxClassification: 'thirdPartyCountry' },
+	{ countryCode: 'GB', countryNameEN: 'United Kingdom', countryNameDE: 'Vereinigtes Königreich', taxClassification: 'thirdPartyCountry' },
+];
+
+// The real /v1/countries list contains ~250 entries; generate a large-enough body
+// that would expose any premature truncation before JSON.parse (>24 000 chars).
+const LARGE_COUNTRIES_JSON = JSON.stringify(
+	Array.from({ length: 250 }, (_, i) => ({
+		countryCode: `C${String(i).padStart(2, '0')}`,
+		countryNameEN: `Country${i} with a deliberately long name to inflate body size`,
+		countryNameDE: `Land${i} mit einem absichtlich langen Namen zur Vergrößerung der Antwort`,
+		taxClassification: i % 3 === 0 ? 'intraCommunity' : 'thirdPartyCountry',
+	})),
+);
+
+test('large valid JSON reference response (like /v1/countries) is parsed into res.data, not truncated to res.text', async () => {
+	// Regression: before the BOM-strip fix, a UTF-8 BOM at position 0 caused JSON.parse
+	// to throw, falling through to the text-truncation path. Even without BOM, this test
+	// verifies that a body >24 000 chars is still fully parsed when it is valid JSON.
+	assert.ok(LARGE_COUNTRIES_JSON.length > 24_000, 'fixture must exceed maxResponseChars to expose any truncation-before-parse bug');
+
+	const fetchImpl: typeof fetch = async () => responseFor(200, LARGE_COUNTRIES_JSON, { 'content-type': 'application/json' });
+	const response = await clientWithFetch(fetchImpl).request({ path: '/v1/countries' });
+
+	assert.equal(response.ok, true);
+	assert.equal(response.status, 200);
+	assert.equal(response.contentType, 'application/json');
+	assert.ok(Array.isArray(response.data), 'res.data must be an array (hasData: true, dataType: "array")');
+	assert.equal(Object.prototype.hasOwnProperty.call(response, 'text'), false, 'res.text must be absent for parsed JSON');
+	assert.equal(Object.prototype.hasOwnProperty.call(response, 'truncated'), false, 'res.truncated must be absent for parsed JSON');
+});
+
+test('large valid JSON with UTF-8 BOM is parsed into res.data (BOM regression)', async () => {
+	// Reproduce the observed live-testing failure: API returns application/json with a
+	// leading UTF-8 BOM (﻿). JSON.parse rejects the BOM, causing the response to
+	// fall through to text/truncation handling instead of populating res.data.
+	const bomBody = '﻿' + JSON.stringify(COUNTRIES_FIXTURE);
+	const fetchImpl: typeof fetch = async () => responseFor(200, bomBody, { 'content-type': 'application/json' });
+	const response = await clientWithFetch(fetchImpl).request({ path: '/v1/countries' });
+
+	assert.equal(response.ok, true);
+	assert.equal(response.contentType, 'application/json');
+	assert.ok(Array.isArray(response.data), 'BOM-prefixed JSON must be parsed into res.data');
+	assert.equal(Object.prototype.hasOwnProperty.call(response, 'text'), false);
+	assert.equal(Object.prototype.hasOwnProperty.call(response, 'truncated'), false);
+	assert.deepEqual(response.data, COUNTRIES_FIXTURE);
+});
