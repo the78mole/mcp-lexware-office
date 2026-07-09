@@ -7,10 +7,11 @@ import { QuickJsExecutor } from './executor.js';
 import { LexwareApiClient } from './lexware-client.js';
 import { lexwareSpec } from './lexware-spec.js';
 import { stringifyForMcp } from './truncate.js';
+import { VERSION } from '../version.js';
 
 const server = new McpServer({
 	name: 'lexware-office-v2',
-	version: '1.5.0',
+	version: VERSION,
 });
 
 const searchExecutor = new QuickJsExecutor();

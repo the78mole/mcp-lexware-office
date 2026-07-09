@@ -5,127 +5,157 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
 
-import { makeLexwareOfficeRequest, makeLexwareOfficeFileRequest, makeLexwareOfficeWriteRequest, makeLexwareOfficeMultipartRequest } from './helper.js';
+import { lexwareRequest, makeLexwareOfficeRequest, makeLexwareOfficeFileRequest, makeLexwareOfficeWriteRequest, makeLexwareOfficeMultipartRequest, type WriteResult } from './helper.js';
 import { logger } from './logger.js';
+import { VERSION } from './version.js';
 
-const contactPersonSchema = z.object({
-	salutation: z.string().optional(),
-	firstName: z.string().optional(),
-	lastName: z.string(),
-	emailAddress: z.string().optional(),
-	phoneNumber: z.string().optional(),
-});
+type ToolResponse = { content: Array<{ type: 'text'; text: string }> };
 
-const addressEntrySchema = z.object({
-	street: z.string().optional(),
-	zip: z.string().optional(),
-	city: z.string().optional(),
-	countryCode: z.string().length(2).optional(),
-	supplement: z.string().optional(),
-});
+function textResponse(text: string): ToolResponse {
+	return { content: [{ type: 'text', text }] };
+}
 
-function writeErrorResponse(result: { status: number; error: unknown } | null): string {
-	if (!result) return 'Request failed due to a network or server error.';
+function writeErrorResponse(result: WriteResult<unknown> | null): string {
+	if (!result || result.ok) return 'Request failed due to a network or server error.';
 	if (result.status === 404) return 'Record not found.';
 	if (result.status === 409) return 'Version conflict — please re-fetch the record and try again.';
 	if (result.status === 401 || result.status === 403) return 'Authentication or permission error.';
 	return `API error (${result.status}): ${JSON.stringify(result.error, null, 2)}`;
 }
 
+function writeResultResponse<T>(
+	result: WriteResult<T> | null,
+	formatSuccess: (data: T) => string,
+): ToolResponse {
+	if (!result || !result.ok) return textResponse(writeErrorResponse(result));
+	return textResponse(formatSuccess(result.data));
+}
+
 const server = new McpServer({
 	name: 'lexware-office',
-	version: '1.5.0',
+	version: VERSION,
 });
 
-server.tool(
-	'get-invoices',
-	'Get a list of natively created invoices from Lexware Office. IMPORTANT: This only returns invoices created directly in Lexware Office. Externally created invoices imported as bookkeeping entries (Ausgangsbelege) are NOT included here — use get-vouchers with voucherType=salesinvoice for those. For a complete picture of what a customer owes, use get-open-receivables instead.',
-	{
-		status: z
-			.array(z.enum(['open', 'draft', 'paid', 'paidoff', 'voided']))
-			.optional()
-			.default(['open', 'draft', 'paid', 'paidoff', 'voided']),
-		contactId: z
-			.string()
-			.uuid()
-			.optional()
-			.describe('Filter by contact ID — returns only invoices for this customer/vendor'),
+function registerVoucherListTool(cfg: {
+	name: string;
+	description: string;
+	voucherType: string;
+	statuses: [string, ...string[]];
+	responseNoun: string;
+	emptyText: string;
+	sizeDescription: string;
+	contactIdDescription?: string;
+}) {
+	const schema = {
+		status: z.array(z.enum(cfg.statuses)).optional().default(cfg.statuses),
+		...(cfg.contactIdDescription !== undefined
+			? { contactId: z.string().uuid().optional().describe(cfg.contactIdDescription) }
+			: {}),
 		page: z.number().min(0).optional().default(0).describe('page number to retrieve; starts at 0'),
-		size: z
-			.number()
-			.min(1)
-			.max(250)
-			.optional()
-			.default(250)
-			.describe('number of invoices to retrieve per page'),
-	},
-	async ({ status, contactId, page, size }) => {
-		let voucherlistUrl = `/v1/voucherlist?voucherType=invoice&voucherStatus=${status.join(',')}&page=${page}&size=${size}`;
-		if (contactId) voucherlistUrl += `&contactId=${contactId}`;
-		const voucherlistData = await makeLexwareOfficeRequest<any>(voucherlistUrl);
-		const vouchers = voucherlistData.content;
+		size: z.number().min(1).max(250).optional().default(250).describe(cfg.sizeDescription),
+	} as z.ZodRawShape;
+
+	server.tool(cfg.name, cfg.description, schema, async (args) => {
+		const { status, contactId, page, size } = args as {
+			status: string[];
+			contactId?: string;
+			page: number;
+			size: number;
+		};
+		let url = `/v1/voucherlist?voucherType=${cfg.voucherType}&voucherStatus=${status.join(',')}&page=${page}&size=${size}`;
+		if (contactId) url += `&contactId=${contactId}`;
+		const data = await makeLexwareOfficeRequest<any>(url);
+		const vouchers = data?.content;
 
 		if (!vouchers || vouchers.length === 0) {
-			return {
-				content: [
-					{
-						type: 'text',
-						text: 'Failed to retrieve invoices',
-					},
-				],
-			};
+			return textResponse(cfg.emptyText);
 		}
 
-		const response = `There are ${vouchers.length} invoices in Lexware Office:\n\n${JSON.stringify(
-			vouchers,
-			null,
-			2,
-		)}`;
+		return textResponse(
+			`There are ${data.totalElements} ${cfg.responseNoun} in total (showing ${vouchers.length} on page ${page}):\n\n${JSON.stringify(vouchers, null, 2)}`,
+		);
+	});
+}
 
-		return {
-			content: [
-				{
-					type: 'text',
-					text: response,
-				},
-			],
-		};
-	},
-);
+function registerDetailTool(cfg: {
+	name: string;
+	description: string;
+	path: string;
+	idDescription: string;
+	failText: string;
+	successLabel: string;
+}) {
+	server.tool(
+		cfg.name,
+		cfg.description,
+		{ id: z.string().uuid().describe(cfg.idDescription) },
+		async ({ id }) => {
+			const data = await makeLexwareOfficeRequest<any>(`${cfg.path}/${id}`);
 
-server.tool(
-	'get-invoice-details',
-	'Get details of an invoice from Lexware Office',
-	{
-		id: z.string().uuid().describe('The id of the invoice'),
-	},
-	async ({ id }) => {
-		const invoiceUrl = `/v1/invoices/${id}`;
-		const invoiceData = await makeLexwareOfficeRequest<any>(invoiceUrl);
+			if (!data) {
+				return textResponse(cfg.failText);
+			}
 
-		if (!invoiceData) {
-			return {
-				content: [
-					{
-						type: 'text',
-						text: 'Failed to retrieve invoice data',
-					},
-				],
-			};
+			return textResponse(`${cfg.successLabel}:\n\n${JSON.stringify(data, null, 2)}`);
+		},
+	);
+}
+
+function registerSalesDocumentTools(cfg: {
+	noun: string; // used in the success message, e.g. 'Credit note'
+	slug: string; // tool names become create-<slug> / finalize-<slug>
+	path: string;
+	schema: z.ZodRawShape;
+	createDescription: string;
+	finalizeDescription: string;
+	queryParamKeys?: string[]; // params the API expects as query string instead of body
+	includeTotalPrice?: boolean; // default true; delivery notes carry no prices
+}) {
+	const handle = async (params: Record<string, unknown>, finalize: boolean): Promise<ToolResponse> => {
+		const query = new URLSearchParams();
+		const body: Record<string, unknown> = {};
+		for (const [key, value] of Object.entries(params)) {
+			if (cfg.queryParamKeys?.includes(key)) {
+				query.set(key, String(value));
+			} else {
+				body[key] = value;
+			}
 		}
+		if (finalize) query.set('finalize', 'true');
+		if (cfg.includeTotalPrice !== false) body.totalPrice = { currency: 'EUR' };
 
-		const response = `Invoice details:\n\n${JSON.stringify(invoiceData, null, 2)}`;
+		const queryString = query.toString();
+		const path = queryString ? `${cfg.path}?${queryString}` : cfg.path;
+		const result = await makeLexwareOfficeWriteRequest<any>(path, 'POST', body);
 
-		return {
-			content: [
-				{
-					type: 'text',
-					text: response,
-				},
-			],
-		};
-	},
-);
+		const action = finalize ? 'created and finalized' : 'created as draft';
+		return writeResultResponse(result, (data) => `${cfg.noun} ${action} successfully:\n\n${JSON.stringify(data, null, 2)}`);
+	};
+
+	server.tool(`create-${cfg.slug}`, cfg.createDescription, cfg.schema, async (params) => handle(params, false));
+	server.tool(`finalize-${cfg.slug}`, cfg.finalizeDescription, cfg.schema, async (params) => handle(params, true));
+}
+
+registerVoucherListTool({
+	name: 'get-invoices',
+	description:
+		'Get a list of natively created invoices from Lexware Office. IMPORTANT: This only returns invoices created directly in Lexware Office. Externally created invoices imported as bookkeeping entries (Ausgangsbelege) are NOT included here — use get-vouchers with voucherType=salesinvoice for those. For a complete picture of what a customer owes, use get-open-receivables instead.',
+	voucherType: 'invoice',
+	statuses: ['open', 'draft', 'paid', 'paidoff', 'voided'],
+	responseNoun: 'invoices',
+	emptyText: 'No invoices found',
+	sizeDescription: 'number of invoices to retrieve per page',
+	contactIdDescription: 'Filter by contact ID — returns only invoices for this customer/vendor',
+});
+
+registerDetailTool({
+	name: 'get-invoice-details',
+	description: 'Get details of an invoice from Lexware Office',
+	path: '/v1/invoices',
+	idDescription: 'The id of the invoice',
+	failText: 'Failed to retrieve invoice data',
+	successLabel: 'Invoice details',
+});
 
 server.tool(
 	'get-contacts',
@@ -183,14 +213,7 @@ server.tool(
 	async ({ email, name, number, customer, vendor, page, size, fetchAll }) => {
 		// fetchAll + page is a configuration conflict
 		if (fetchAll && page !== undefined) {
-			return {
-				content: [
-					{
-						type: 'text',
-						text: 'fetchAll and page are mutually exclusive. Use fetchAll: true OR page/size, not both.',
-					},
-				],
-			};
+			return textResponse('fetchAll and page are mutually exclusive. Use fetchAll: true OR page/size, not both.');
 		}
 
 		// Filter params only — page/size appended separately per mode to prevent double-append
@@ -210,12 +233,10 @@ server.tool(
 			const contactsData = await makeLexwareOfficeRequest<any>(`/v1/contacts?${params.toString()}`);
 
 			if (!contactsData) {
-				return { content: [{ type: 'text', text: 'Failed to retrieve contacts' }] };
+				return textResponse('Failed to retrieve contacts');
 			}
 
-			return {
-				content: [{ type: 'text', text: `Contacts:\n\n${JSON.stringify(contactsData, null, 2)}` }],
-			};
+			return textResponse(`Contacts:\n\n${JSON.stringify(contactsData, null, 2)}`);
 		}
 
 		// fetchAll mode — sequential pagination, 550ms delay before each page after page 0
@@ -226,7 +247,7 @@ server.tool(
 		const page0Data = await makeLexwareOfficeRequest<any>(`/v1/contacts?${page0Params.toString()}`);
 
 		if (!page0Data) {
-			return { content: [{ type: 'text', text: 'Failed to retrieve contacts (page 0)' }] };
+			return textResponse('Failed to retrieve contacts (page 0)');
 		}
 
 		const totalPages: number = page0Data.totalPages;
@@ -252,23 +273,18 @@ server.tool(
 			}
 		}
 
-		return {
-			content: [
+		return textResponse(
+			JSON.stringify(
 				{
-					type: 'text',
-					text: JSON.stringify(
-						{
-							totalElements: page0Data.totalElements,
-							totalPages,
-							contacts: allContacts,
-							warnings,
-						},
-						null,
-						2,
-					),
+					totalElements: page0Data.totalElements,
+					totalPages,
+					contacts: allContacts,
+					warnings,
 				},
-			],
-		};
+				null,
+				2,
+			),
+		);
 	},
 );
 
@@ -279,18 +295,10 @@ server.tool(
 		type: z.enum(['income', 'outgo']).optional().describe('Filter posting categories by type'),
 	},
 	async ({ type }) => {
-		const postingCategoriesUrl = `/v1/posting-categories`;
-		const postingCategoriesData = await makeLexwareOfficeRequest<any>(postingCategoriesUrl);
+		const postingCategoriesData = await makeLexwareOfficeRequest<any>('/v1/posting-categories');
 
 		if (!postingCategoriesData) {
-			return {
-				content: [
-					{
-						type: 'text',
-						text: 'Failed to retrieve posting categories',
-					},
-				],
-			};
+			return textResponse('Failed to retrieve posting categories');
 		}
 
 		// Filter by type if specified
@@ -299,16 +307,7 @@ server.tool(
 			filteredCategories = postingCategoriesData.filter((category: any) => category.type === type);
 		}
 
-		const response = `Posting Categories:\n\n${JSON.stringify(filteredCategories, null, 2)}`;
-
-		return {
-			content: [
-				{
-					type: 'text',
-					text: response,
-				},
-			],
-		};
+		return textResponse(`Posting Categories:\n\n${JSON.stringify(filteredCategories, null, 2)}`);
 	},
 );
 
@@ -324,18 +323,10 @@ server.tool(
 			),
 	},
 	async ({ taxClassification }) => {
-		const countriesUrl = `/v1/countries`;
-		const countriesData = await makeLexwareOfficeRequest<any>(countriesUrl);
+		const countriesData = await makeLexwareOfficeRequest<any>('/v1/countries');
 
 		if (!countriesData) {
-			return {
-				content: [
-					{
-						type: 'text',
-						text: 'Failed to retrieve countries',
-					},
-				],
-			};
+			return textResponse('Failed to retrieve countries');
 		}
 
 		// Filter by taxClassification if specified
@@ -346,16 +337,7 @@ server.tool(
 			);
 		}
 
-		const response = `Countries:\n\n${JSON.stringify(filteredCountries, null, 2)}`;
-
-		return {
-			content: [
-				{
-					type: 'text',
-					text: response,
-				},
-			],
-		};
+		return textResponse(`Countries:\n\n${JSON.stringify(filteredCountries, null, 2)}`);
 	},
 );
 
@@ -403,26 +385,12 @@ server.tool(
 		const vouchers = voucherlistData?.content;
 
 		if (!vouchers || vouchers.length === 0) {
-			return {
-				content: [
-					{
-						type: 'text',
-						text: 'No vouchers found',
-					},
-				],
-			};
+			return textResponse('No vouchers found');
 		}
 
-		const response = `There are ${voucherlistData.totalElements} vouchers in total (showing ${vouchers.length} on page ${page}):\n\n${JSON.stringify(vouchers, null, 2)}`;
-
-		return {
-			content: [
-				{
-					type: 'text',
-					text: response,
-				},
-			],
-		};
+		return textResponse(
+			`There are ${voucherlistData.totalElements} vouchers in total (showing ${vouchers.length} on page ${page}):\n\n${JSON.stringify(vouchers, null, 2)}`,
+		);
 	},
 );
 
@@ -448,9 +416,7 @@ server.tool(
 		const salesVouchers = vouchersData?.content ?? [];
 
 		if (nativeInvoices.length === 0 && salesVouchers.length === 0) {
-			return {
-				content: [{ type: 'text', text: 'No open receivables found for this contact.' }],
-			};
+			return textResponse('No open receivables found for this contact.');
 		}
 
 		const totalNative = nativeInvoices.reduce((sum: number, v: any) => sum + (v.totalAmount ?? 0), 0);
@@ -473,45 +439,18 @@ server.tool(
 			lines.push(`\n--- Ausgangsbelege (salesinvoice vouchers) ---\n${JSON.stringify(salesVouchers, null, 2)}`);
 		}
 
-		return {
-			content: [{ type: 'text', text: lines.join('\n') }],
-		};
+		return textResponse(lines.join('\n'));
 	},
 );
 
-server.tool(
-	'get-voucher-details',
-	'Get details of a bookkeeping voucher from Lexware Office by its ID',
-	{
-		id: z.string().uuid().describe('The id of the voucher'),
-	},
-	async ({ id }) => {
-		const voucherUrl = `/v1/vouchers/${id}`;
-		const voucherData = await makeLexwareOfficeRequest<any>(voucherUrl);
-
-		if (!voucherData) {
-			return {
-				content: [
-					{
-						type: 'text',
-						text: 'Failed to retrieve voucher data',
-					},
-				],
-			};
-		}
-
-		const response = `Voucher details:\n\n${JSON.stringify(voucherData, null, 2)}`;
-
-		return {
-			content: [
-				{
-					type: 'text',
-					text: response,
-				},
-			],
-		};
-	},
-);
+registerDetailTool({
+	name: 'get-voucher-details',
+	description: 'Get details of a bookkeeping voucher from Lexware Office by its ID',
+	path: '/v1/vouchers',
+	idDescription: 'The id of the voucher',
+	failText: 'Failed to retrieve voucher data',
+	successLabel: 'Voucher details',
+});
 
 server.tool(
 	'get-file',
@@ -529,14 +468,7 @@ server.tool(
 		const fileData = await makeLexwareOfficeFileRequest(`/v1/files/${id}`, accept);
 
 		if (!fileData) {
-			return {
-				content: [
-					{
-						type: 'text',
-						text: 'Failed to retrieve file',
-					},
-				],
-			};
+			return textResponse('Failed to retrieve file');
 		}
 
 		return {
@@ -567,7 +499,7 @@ server.tool(
 		const fileData = await makeLexwareOfficeFileRequest(`/v1/${docType}/${id}/file`, 'application/pdf');
 
 		if (!fileData) {
-			return { content: [{ type: 'text', text: 'Failed to retrieve document file. Ensure the document is finalized.' }] };
+			return textResponse('Failed to retrieve document file. Ensure the document is finalized.');
 		}
 
 		return {
@@ -592,36 +524,20 @@ server.tool(
 		id: z.string().uuid().describe('The ID of the invoice or voucher to retrieve payment information for'),
 	},
 	async ({ id }) => {
-		const LEXWARE_OFFICE_API_KEY = process.env.LEXWARE_OFFICE_API_KEY!;
-		const response = await fetch(`https://api.lexware.io/v1/payments/${id}`, {
-			headers: {
-				Accept: 'application/json',
-				Authorization: `Bearer ${LEXWARE_OFFICE_API_KEY}`,
-			},
-		}).catch(() => null);
+		const result = await lexwareRequest<any>(`/v1/payments/${id}`);
 
-		if (!response) {
-			return { content: [{ type: 'text', text: 'Network error retrieving payment information' }] };
+		if (!result) {
+			return textResponse('Network error retrieving payment information');
 		}
 
-		let body: unknown;
-		try { body = await response.json(); } catch { body = null; }
-
-		if (response.status === 406) {
-			return {
-				content: [{ type: 'text', text: "Keine Zahlungsinformationen verfügbar — Beleg hat Status 'unchecked'. Zahlungen werden intern von Lexware gesetzt (nach manueller Eingabe oder Bank-Matching)." }],
-			};
+		if (!result.ok) {
+			if (result.status === 406) {
+				return textResponse("Keine Zahlungsinformationen verfügbar — Beleg hat Status 'unchecked'. Zahlungen werden intern von Lexware gesetzt (nach manueller Eingabe oder Bank-Matching).");
+			}
+			return textResponse(`API error ${result.status}: ${JSON.stringify(result.error)}`);
 		}
 
-		if (!response.ok) {
-			return {
-				content: [{ type: 'text', text: `API error ${response.status}: ${JSON.stringify(body)}` }],
-			};
-		}
-
-		return {
-			content: [{ type: 'text', text: `Payment information:\n\n${JSON.stringify(body, null, 2)}` }],
-		};
+		return textResponse(`Payment information:\n\n${JSON.stringify(result.data, null, 2)}`);
 	},
 );
 
@@ -633,19 +549,10 @@ server.tool(
 		const data = await makeLexwareOfficeRequest<any>('/v1/payment-conditions');
 
 		if (!data) {
-			return {
-				content: [{ type: 'text', text: 'Failed to retrieve payment conditions' }],
-			};
+			return textResponse('Failed to retrieve payment conditions');
 		}
 
-		return {
-			content: [
-				{
-					type: 'text',
-					text: `Payment conditions:\n\n${JSON.stringify(data, null, 2)}`,
-				},
-			],
-		};
+		return textResponse(`Payment conditions:\n\n${JSON.stringify(data, null, 2)}`);
 	},
 );
 
@@ -768,20 +675,7 @@ server.tool(
 			...(note !== undefined ? { note } : {}),
 		});
 
-		if (!result || !result.ok) {
-			return {
-				content: [{ type: 'text', text: writeErrorResponse(result && !result.ok ? result : null) }],
-			};
-		}
-
-		return {
-			content: [
-				{
-					type: 'text',
-					text: `Contact created successfully:\n\n${JSON.stringify(result.data, null, 2)}`,
-				},
-			],
-		};
+		return writeResultResponse(result, (data) => `Contact created successfully:\n\n${JSON.stringify(data, null, 2)}`);
 	},
 );
 
@@ -845,14 +739,12 @@ server.tool(
 		contactPersons,
 	}) => {
 		if (!customer && !vendor) {
-			return {
-				content: [{ type: 'text', text: 'Error: Lexoffice requires at least one role. Set customer or vendor to true.' }],
-			};
+			return textResponse('Error: Lexoffice requires at least one role. Set customer or vendor to true.');
 		}
 
 		const existing = await makeLexwareOfficeRequest<any>(`/v1/contacts/${id}`);
 		if (!existing) {
-			return { content: [{ type: 'text', text: 'Failed to fetch existing contact data' }] };
+			return textResponse('Failed to fetch existing contact data');
 		}
 
 		const existingRoles: Record<string, any> = existing.roles ?? {};
@@ -946,41 +838,18 @@ server.tool(
 			...(Object.keys(phoneNumbersPayload).length > 0 ? { phoneNumbers: phoneNumbersPayload } : {}),
 		});
 
-		if (!result || !result.ok) {
-			return {
-				content: [{ type: 'text', text: writeErrorResponse(result && !result.ok ? result : null) }],
-			};
-		}
-
-		return {
-			content: [
-				{
-					type: 'text',
-					text: `Contact updated successfully:\n\n${JSON.stringify(result.data, null, 2)}`,
-				},
-			],
-		};
+		return writeResultResponse(result, (data) => `Contact updated successfully:\n\n${JSON.stringify(data, null, 2)}`);
 	},
 );
 
-server.tool(
-	'get-contact-details',
-	'Get details of a single contact from Lexware Office by its ID. Returns full contact data including roles, address, and contact persons.',
-	{
-		id: z.string().uuid().describe('The ID of the contact'),
-	},
-	async ({ id }) => {
-		const data = await makeLexwareOfficeRequest<any>(`/v1/contacts/${id}`);
-
-		if (!data) {
-			return { content: [{ type: 'text', text: 'Failed to retrieve contact data' }] };
-		}
-
-		return {
-			content: [{ type: 'text', text: `Contact details:\n\n${JSON.stringify(data, null, 2)}` }],
-		};
-	},
-);
+registerDetailTool({
+	name: 'get-contact-details',
+	description: 'Get details of a single contact from Lexware Office by its ID. Returns full contact data including roles, address, and contact persons.',
+	path: '/v1/contacts',
+	idDescription: 'The ID of the contact',
+	failText: 'Failed to retrieve contact data',
+	successLabel: 'Contact details',
+});
 
 const unitPriceSchema = z.object({
 	currency: z.literal('EUR'),
@@ -1068,45 +937,16 @@ const invoiceSchema = {
 	remark: z.string().optional().describe('Closing text after line items'),
 };
 
-async function handleInvoiceRequest(
-	params: Record<string, unknown>,
-	finalize: boolean,
-): Promise<{ content: Array<{ type: 'text'; text: string }> }> {
-	const path = finalize ? '/v1/invoices?finalize=true' : '/v1/invoices';
-	const body = {
-		...params,
-		totalPrice: { currency: 'EUR' },
-	};
-	const result = await makeLexwareOfficeWriteRequest<any>(path, 'POST', body);
-
-	if (!result || !result.ok) {
-		return { content: [{ type: 'text', text: writeErrorResponse(result && !result.ok ? result : null) }] };
-	}
-
-	const action = finalize ? 'created and finalized' : 'created as draft';
-	return {
-		content: [
-			{
-				type: 'text',
-				text: `Invoice ${action} successfully:\n\n${JSON.stringify(result.data, null, 2)}`,
-			},
-		],
-	};
-}
-
-server.tool(
-	'create-invoice',
-	'Create a new invoice as a draft in Lexware Office. The invoice will not be sent to the customer. Use finalize-invoice to create and immediately finalize.',
-	invoiceSchema,
-	async (params) => handleInvoiceRequest(params, false),
-);
-
-server.tool(
-	'finalize-invoice',
-	'Create and immediately finalize (publish) an invoice in Lexware Office. The invoice will be locked and cannot be edited. Use create-invoice to create a draft first.',
-	invoiceSchema,
-	async (params) => handleInvoiceRequest(params, true),
-);
+registerSalesDocumentTools({
+	noun: 'Invoice',
+	slug: 'invoice',
+	path: '/v1/invoices',
+	schema: invoiceSchema,
+	createDescription:
+		'Create a new invoice as a draft in Lexware Office. The invoice will not be sent to the customer. Use finalize-invoice to create and immediately finalize.',
+	finalizeDescription:
+		'Create and immediately finalize (publish) an invoice in Lexware Office. The invoice will be locked and cannot be edited. Use create-invoice to create a draft first.',
+});
 
 const dunningSchema = {
 	precedingSalesVoucherId: z
@@ -1128,83 +968,37 @@ const dunningSchema = {
 	remark: z.string().optional(),
 };
 
-async function handleDunningRequest(
-	params: Record<string, unknown>,
-	finalize: boolean,
-): Promise<{ content: Array<{ type: 'text'; text: string }> }> {
-	const { precedingSalesVoucherId, ...rest } = params;
-	const queryParams = new URLSearchParams({
-		precedingSalesVoucherId: precedingSalesVoucherId as string,
-		...(finalize ? { finalize: 'true' } : {}),
-	});
-	const path = `/v1/dunnings?${queryParams.toString()}`;
-	const body = {
-		...rest,
-		totalPrice: { currency: 'EUR' },
-	};
-	const result = await makeLexwareOfficeWriteRequest<any>(path, 'POST', body);
-
-	if (!result || !result.ok) {
-		return { content: [{ type: 'text', text: writeErrorResponse(result && !result.ok ? result : null) }] };
-	}
-
-	const action = finalize ? 'created and finalized' : 'created as draft';
-	return {
-		content: [
-			{
-				type: 'text',
-				text: `Dunning ${action} successfully:\n\n${JSON.stringify(result.data, null, 2)}`,
-			},
-		],
-	};
-}
-
-server.tool(
-	'create-dunning',
-	'Create a dunning notice (Mahnung) in Lexware Office for an existing invoice. Note: the Lexware Office API always returns voucherStatus "draft" for dunnings regardless of finalization — this is expected API behaviour. A PDF is generated immediately upon creation.',
-	dunningSchema,
-	async (params) => handleDunningRequest(params, false),
-);
-
-server.tool(
-	'finalize-dunning',
-	'Create a dunning notice (Mahnung) in Lexware Office for an existing invoice (alias for create-dunning). Note: the Lexware Office API always returns voucherStatus "draft" for dunnings — this is expected API behaviour, not an error. A PDF is generated immediately upon creation.',
-	dunningSchema,
-	async (params) => handleDunningRequest(params, true),
-);
+registerSalesDocumentTools({
+	noun: 'Dunning',
+	slug: 'dunning',
+	path: '/v1/dunnings',
+	schema: dunningSchema,
+	queryParamKeys: ['precedingSalesVoucherId'],
+	createDescription:
+		'Create a dunning notice (Mahnung) in Lexware Office for an existing invoice. Note: the Lexware Office API always returns voucherStatus "draft" for dunnings regardless of finalization — this is expected API behaviour. A PDF is generated immediately upon creation.',
+	finalizeDescription:
+		'Create a dunning notice (Mahnung) in Lexware Office for an existing invoice (alias for create-dunning). Note: the Lexware Office API always returns voucherStatus "draft" for dunnings — this is expected API behaviour, not an error. A PDF is generated immediately upon creation.',
+});
 
 server.tool(
 	'get-dunnings',
 	'Note: The Lexware Office API does not support listing dunnings. Use get-dunning-details with a known dunning ID instead. Dunning IDs can be found in the relatedVouchers field of an invoice (get-invoice-details).',
 	{},
 	async () => {
-		return {
-			content: [{
-				type: 'text',
-				text: 'The Lexware Office API does not support listing dunnings. To retrieve a dunning, use get-dunning-details with a known dunning ID. You can find dunning IDs in the relatedVouchers field of the associated invoice (use get-invoice-details).',
-			}],
-		};
+		return textResponse(
+			'The Lexware Office API does not support listing dunnings. To retrieve a dunning, use get-dunning-details with a known dunning ID. You can find dunning IDs in the relatedVouchers field of the associated invoice (use get-invoice-details).',
+		);
 	},
 );
 
-server.tool(
-	'get-dunning-details',
-	'Get details of a dunning notice (Mahnung) from Lexware Office by its ID',
-	{
-		id: z.string().uuid().describe('The ID of the dunning'),
-	},
-	async ({ id }) => {
-		const data = await makeLexwareOfficeRequest<any>(`/v1/dunnings/${id}`);
-
-		if (!data) {
-			return { content: [{ type: 'text', text: 'Failed to retrieve dunning data' }] };
-		}
-
-		return {
-			content: [{ type: 'text', text: `Dunning details:\n\n${JSON.stringify(data, null, 2)}` }],
-		};
-	},
-);
+registerDetailTool({
+	name: 'get-dunning-details',
+	description: 'Get details of a dunning notice (Mahnung) from Lexware Office by its ID',
+	path: '/v1/dunnings',
+	idDescription: 'The ID of the dunning',
+	failText: 'Failed to retrieve dunning data',
+	successLabel: 'Dunning details',
+});
 
 server.tool(
 	'create-voucher',
@@ -1247,18 +1041,7 @@ server.tool(
 			totalTaxAmount,
 		});
 
-		if (!result || !result.ok) {
-			return { content: [{ type: 'text', text: writeErrorResponse(result && !result.ok ? result : null) }] };
-		}
-
-		return {
-			content: [
-				{
-					type: 'text',
-					text: `Voucher created successfully:\n\n${JSON.stringify(result.data, null, 2)}`,
-				},
-			],
-		};
+		return writeResultResponse(result, (data) => `Voucher created successfully:\n\n${JSON.stringify(data, null, 2)}`);
 	},
 );
 
@@ -1288,13 +1071,10 @@ server.tool(
 		voucherStatus: z.enum(['unchecked', 'open']).optional().describe("Set the voucher status. 'open' finalizes the voucher (unchecked → open)."),
 	},
 	async ({ id, ...body }) => {
-		const LEXOFFICE_API_BASE = 'https://api.lexware.io';
-		const LEXWARE_OFFICE_API_KEY = process.env.LEXWARE_OFFICE_API_KEY!;
-
 		// Save file IDs before PUT — Lexware API silently drops all attachments on PUT
 		const currentVoucher = await makeLexwareOfficeRequest<any>(`/v1/vouchers/${id}`);
 		if (!currentVoucher) {
-			return { content: [{ type: 'text', text: 'Failed to fetch current voucher before update — aborting to prevent file loss. Check connectivity and try again.' }] };
+			return textResponse('Failed to fetch current voucher before update — aborting to prevent file loss. Check connectivity and try again.');
 		}
 		const savedFileIds: string[] = Array.isArray(currentVoucher.files) ? currentVoucher.files : [];
 
@@ -1307,30 +1087,21 @@ server.tool(
 		});
 
 		if (!result || !result.ok) {
-			return { content: [{ type: 'text', text: writeErrorResponse(result && !result.ok ? result : null) }] };
+			return textResponse(writeErrorResponse(result));
 		}
 
 		// Re-attach files that were present before the PUT
 		const reattachWarnings: string[] = [];
 		for (const fileId of savedFileIds) {
 			try {
-				// Raw fetch: makeLexwareOfficeFileRequest type-constrains Accept to PDF/XML and is
-				// designed for the get-file MCP response path, not for internal file transfers.
-				const downloadResponse = await fetch(`${LEXOFFICE_API_BASE}/v1/files/${fileId}`, {
-					headers: {
-						'Accept': '*/*',
-						'Authorization': `Bearer ${LEXWARE_OFFICE_API_KEY}`,
-					},
-				});
-				if (!downloadResponse.ok) {
-					reattachWarnings.push(`${fileId} (download failed: ${downloadResponse.status})`);
+				const download = await makeLexwareOfficeFileRequest(`/v1/files/${fileId}`, '*/*');
+				if (!download) {
+					reattachWarnings.push(`${fileId} (download failed)`);
 					continue;
 				}
-				const contentType = downloadResponse.headers.get('content-type') ?? 'application/pdf';
-				const contentDisposition = downloadResponse.headers.get('content-disposition') ?? '';
-				const filename = contentDisposition.match(/filename="?([^";\n]+)"?/)?.[1] ?? `${fileId}.pdf`;
-				const fileBuffer = await downloadResponse.arrayBuffer();
-				const blob = new Blob([fileBuffer], { type: contentType });
+				const blobType = download.mimeType === '*/*' ? 'application/pdf' : download.mimeType;
+				const filename = download.filename ?? `${fileId}.pdf`;
+				const blob = new Blob([new Uint8Array(download.data)], { type: blobType });
 				const formData = new FormData();
 				formData.append('file', blob, filename);
 				const uploadResult = await makeLexwareOfficeMultipartRequest<any>(`/v1/vouchers/${id}/files`, formData);
@@ -1346,258 +1117,105 @@ server.tool(
 			? `\n\nWarning: could not re-attach file(s): ${reattachWarnings.join(', ')} — re-attach manually using upload-file-to-voucher.`
 			: '';
 
-		return {
-			content: [
-				{
-					type: 'text',
-					text: `Voucher updated successfully:\n\n${JSON.stringify(result.data, null, 2)}${warningText}`,
-				},
-			],
-		};
+		return textResponse(`Voucher updated successfully:\n\n${JSON.stringify(result.data, null, 2)}${warningText}`);
 	},
 );
 
-server.tool(
-	'get-quotations',
-	'Get a list of quotations (Angebote) from Lexware Office',
-	{
-		status: z
-			.array(z.enum(['draft', 'open', 'accepted', 'rejected', 'voided']))
-			.optional()
-			.default(['draft', 'open', 'accepted', 'rejected', 'voided']),
-		page: z.number().min(0).optional().default(0).describe('page number to retrieve; starts at 0'),
-		size: z.number().min(1).max(250).optional().default(250).describe('number of results per page'),
-	},
-	async ({ status, page, size }) => {
-		const url = `/v1/voucherlist?voucherType=quotation&voucherStatus=${status.join(',')}&page=${page}&size=${size}`;
-		const data = await makeLexwareOfficeRequest<any>(url);
-		const vouchers = data?.content;
+registerVoucherListTool({
+	name: 'get-quotations',
+	description: 'Get a list of quotations (Angebote) from Lexware Office',
+	voucherType: 'quotation',
+	statuses: ['draft', 'open', 'accepted', 'rejected', 'voided'],
+	responseNoun: 'quotations',
+	emptyText: 'No quotations found',
+	sizeDescription: 'number of results per page',
+});
 
-		if (!vouchers || vouchers.length === 0) {
-			return { content: [{ type: 'text', text: 'No quotations found' }] };
-		}
+registerDetailTool({
+	name: 'get-quotation-details',
+	description: 'Get details of a quotation (Angebot) from Lexware Office by its ID',
+	path: '/v1/quotations',
+	idDescription: 'The ID of the quotation',
+	failText: 'Failed to retrieve quotation data',
+	successLabel: 'Quotation details',
+});
 
-		return {
-			content: [{
-				type: 'text',
-				text: `There are ${data.totalElements} quotations in total (showing ${vouchers.length} on page ${page}):\n\n${JSON.stringify(vouchers, null, 2)}`,
-			}],
-		};
-	},
-);
+registerVoucherListTool({
+	name: 'get-credit-notes',
+	description: 'Get a list of credit notes (Gutschriften) from Lexware Office',
+	voucherType: 'creditnote',
+	statuses: ['draft', 'open', 'paid', 'voided'],
+	responseNoun: 'credit notes',
+	emptyText: 'No credit notes found',
+	sizeDescription: 'number of results per page',
+});
 
-server.tool(
-	'get-quotation-details',
-	'Get details of a quotation (Angebot) from Lexware Office by its ID',
-	{
-		id: z.string().uuid().describe('The ID of the quotation'),
-	},
-	async ({ id }) => {
-		const data = await makeLexwareOfficeRequest<any>(`/v1/quotations/${id}`);
+registerDetailTool({
+	name: 'get-credit-note-details',
+	description: 'Get details of a credit note (Gutschrift) from Lexware Office by its ID',
+	path: '/v1/credit-notes',
+	idDescription: 'The ID of the credit note',
+	failText: 'Failed to retrieve credit note data',
+	successLabel: 'Credit note details',
+});
 
-		if (!data) {
-			return { content: [{ type: 'text', text: 'Failed to retrieve quotation data' }] };
-		}
+registerVoucherListTool({
+	name: 'get-order-confirmations',
+	description: 'Get a list of order confirmations (Auftragsbestätigungen) from Lexware Office',
+	voucherType: 'orderconfirmation',
+	statuses: ['draft', 'open', 'fulfilled', 'voided'],
+	responseNoun: 'order confirmations',
+	emptyText: 'No order confirmations found',
+	sizeDescription: 'number of results per page',
+});
 
-		return {
-			content: [{ type: 'text', text: `Quotation details:\n\n${JSON.stringify(data, null, 2)}` }],
-		};
-	},
-);
+registerDetailTool({
+	name: 'get-order-confirmation-details',
+	description: 'Get details of an order confirmation (Auftragsbestätigung) from Lexware Office by its ID',
+	path: '/v1/order-confirmations',
+	idDescription: 'The ID of the order confirmation',
+	failText: 'Failed to retrieve order confirmation data',
+	successLabel: 'Order confirmation details',
+});
 
-server.tool(
-	'get-credit-notes',
-	'Get a list of credit notes (Gutschriften) from Lexware Office',
-	{
-		status: z
-			.array(z.enum(['draft', 'open', 'paid', 'voided']))
-			.optional()
-			.default(['draft', 'open', 'paid', 'voided']),
-		page: z.number().min(0).optional().default(0).describe('page number to retrieve; starts at 0'),
-		size: z.number().min(1).max(250).optional().default(250).describe('number of results per page'),
-	},
-	async ({ status, page, size }) => {
-		const url = `/v1/voucherlist?voucherType=creditnote&voucherStatus=${status.join(',')}&page=${page}&size=${size}`;
-		const data = await makeLexwareOfficeRequest<any>(url);
-		const vouchers = data?.content;
+registerVoucherListTool({
+	name: 'get-delivery-notes',
+	description: 'Get a list of delivery notes (Lieferscheine) from Lexware Office',
+	voucherType: 'deliverynote',
+	statuses: ['draft', 'open', 'fulfilled', 'voided'],
+	responseNoun: 'delivery notes',
+	emptyText: 'No delivery notes found',
+	sizeDescription: 'number of results per page',
+});
 
-		if (!vouchers || vouchers.length === 0) {
-			return { content: [{ type: 'text', text: 'No credit notes found' }] };
-		}
+registerDetailTool({
+	name: 'get-delivery-note-details',
+	description: 'Get details of a delivery note (Lieferschein) from Lexware Office by its ID',
+	path: '/v1/delivery-notes',
+	idDescription: 'The ID of the delivery note',
+	failText: 'Failed to retrieve delivery note data',
+	successLabel: 'Delivery note details',
+});
 
-		return {
-			content: [{
-				type: 'text',
-				text: `There are ${data.totalElements} credit notes in total (showing ${vouchers.length} on page ${page}):\n\n${JSON.stringify(vouchers, null, 2)}`,
-			}],
-		};
-	},
-);
+registerVoucherListTool({
+	name: 'get-down-payment-invoices',
+	description: 'Get a list of down payment invoices (Anzahlungsrechnungen) from Lexware Office',
+	voucherType: 'downpaymentinvoice',
+	statuses: ['draft', 'open', 'paid', 'voided'],
+	responseNoun: 'down payment invoices',
+	emptyText: 'No down payment invoices found',
+	sizeDescription: 'number of results per page',
+	contactIdDescription: 'Filter by contact ID',
+});
 
-server.tool(
-	'get-credit-note-details',
-	'Get details of a credit note (Gutschrift) from Lexware Office by its ID',
-	{
-		id: z.string().uuid().describe('The ID of the credit note'),
-	},
-	async ({ id }) => {
-		const data = await makeLexwareOfficeRequest<any>(`/v1/credit-notes/${id}`);
-
-		if (!data) {
-			return { content: [{ type: 'text', text: 'Failed to retrieve credit note data' }] };
-		}
-
-		return {
-			content: [{ type: 'text', text: `Credit note details:\n\n${JSON.stringify(data, null, 2)}` }],
-		};
-	},
-);
-
-server.tool(
-	'get-order-confirmations',
-	'Get a list of order confirmations (Auftragsbestätigungen) from Lexware Office',
-	{
-		status: z
-			.array(z.enum(['draft', 'open', 'fulfilled', 'voided']))
-			.optional()
-			.default(['draft', 'open', 'fulfilled', 'voided']),
-		page: z.number().min(0).optional().default(0).describe('page number to retrieve; starts at 0'),
-		size: z.number().min(1).max(250).optional().default(250).describe('number of results per page'),
-	},
-	async ({ status, page, size }) => {
-		const url = `/v1/voucherlist?voucherType=orderconfirmation&voucherStatus=${status.join(',')}&page=${page}&size=${size}`;
-		const data = await makeLexwareOfficeRequest<any>(url);
-		const vouchers = data?.content;
-
-		if (!vouchers || vouchers.length === 0) {
-			return { content: [{ type: 'text', text: 'No order confirmations found' }] };
-		}
-
-		return {
-			content: [{
-				type: 'text',
-				text: `There are ${data.totalElements} order confirmations in total (showing ${vouchers.length} on page ${page}):\n\n${JSON.stringify(vouchers, null, 2)}`,
-			}],
-		};
-	},
-);
-
-server.tool(
-	'get-order-confirmation-details',
-	'Get details of an order confirmation (Auftragsbestätigung) from Lexware Office by its ID',
-	{
-		id: z.string().uuid().describe('The ID of the order confirmation'),
-	},
-	async ({ id }) => {
-		const data = await makeLexwareOfficeRequest<any>(`/v1/order-confirmations/${id}`);
-
-		if (!data) {
-			return { content: [{ type: 'text', text: 'Failed to retrieve order confirmation data' }] };
-		}
-
-		return {
-			content: [{ type: 'text', text: `Order confirmation details:\n\n${JSON.stringify(data, null, 2)}` }],
-		};
-	},
-);
-
-server.tool(
-	'get-delivery-notes',
-	'Get a list of delivery notes (Lieferscheine) from Lexware Office',
-	{
-		status: z
-			.array(z.enum(['draft', 'open', 'fulfilled', 'voided']))
-			.optional()
-			.default(['draft', 'open', 'fulfilled', 'voided']),
-		page: z.number().min(0).optional().default(0).describe('page number to retrieve; starts at 0'),
-		size: z.number().min(1).max(250).optional().default(250).describe('number of results per page'),
-	},
-	async ({ status, page, size }) => {
-		const url = `/v1/voucherlist?voucherType=deliverynote&voucherStatus=${status.join(',')}&page=${page}&size=${size}`;
-		const data = await makeLexwareOfficeRequest<any>(url);
-		const vouchers = data?.content;
-
-		if (!vouchers || vouchers.length === 0) {
-			return { content: [{ type: 'text', text: 'No delivery notes found' }] };
-		}
-
-		return {
-			content: [{
-				type: 'text',
-				text: `There are ${data.totalElements} delivery notes in total (showing ${vouchers.length} on page ${page}):\n\n${JSON.stringify(vouchers, null, 2)}`,
-			}],
-		};
-	},
-);
-
-server.tool(
-	'get-delivery-note-details',
-	'Get details of a delivery note (Lieferschein) from Lexware Office by its ID',
-	{
-		id: z.string().uuid().describe('The ID of the delivery note'),
-	},
-	async ({ id }) => {
-		const data = await makeLexwareOfficeRequest<any>(`/v1/delivery-notes/${id}`);
-
-		if (!data) {
-			return { content: [{ type: 'text', text: 'Failed to retrieve delivery note data' }] };
-		}
-
-		return {
-			content: [{ type: 'text', text: `Delivery note details:\n\n${JSON.stringify(data, null, 2)}` }],
-		};
-	},
-);
-
-server.tool(
-	'get-down-payment-invoices',
-	'Get a list of down payment invoices (Anzahlungsrechnungen) from Lexware Office',
-	{
-		status: z
-			.array(z.enum(['draft', 'open', 'paid', 'voided']))
-			.optional()
-			.default(['draft', 'open', 'paid', 'voided']),
-		contactId: z.string().uuid().optional().describe('Filter by contact ID'),
-		page: z.number().min(0).optional().default(0).describe('page number to retrieve; starts at 0'),
-		size: z.number().min(1).max(250).optional().default(250).describe('number of results per page'),
-	},
-	async ({ status, contactId, page, size }) => {
-		let url = `/v1/voucherlist?voucherType=downpaymentinvoice&voucherStatus=${status.join(',')}&page=${page}&size=${size}`;
-		if (contactId) url += `&contactId=${contactId}`;
-		const data = await makeLexwareOfficeRequest<any>(url);
-		const vouchers = data?.content;
-
-		if (!vouchers || vouchers.length === 0) {
-			return { content: [{ type: 'text', text: 'No down payment invoices found' }] };
-		}
-
-		return {
-			content: [{
-				type: 'text',
-				text: `There are ${data.totalElements} down payment invoices in total (showing ${vouchers.length} on page ${page}):\n\n${JSON.stringify(vouchers, null, 2)}`,
-			}],
-		};
-	},
-);
-
-server.tool(
-	'get-down-payment-invoice-details',
-	'Get details of a down payment invoice (Anzahlungsrechnung) from Lexware Office by its ID',
-	{
-		id: z.string().uuid().describe('The ID of the down payment invoice'),
-	},
-	async ({ id }) => {
-		const data = await makeLexwareOfficeRequest<any>(`/v1/down-payment-invoices/${id}`);
-
-		if (!data) {
-			return { content: [{ type: 'text', text: 'Failed to retrieve down payment invoice data' }] };
-		}
-
-		return {
-			content: [{ type: 'text', text: `Down payment invoice details:\n\n${JSON.stringify(data, null, 2)}` }],
-		};
-	},
-);
+registerDetailTool({
+	name: 'get-down-payment-invoice-details',
+	description: 'Get details of a down payment invoice (Anzahlungsrechnung) from Lexware Office by its ID',
+	path: '/v1/down-payment-invoices',
+	idDescription: 'The ID of the down payment invoice',
+	failText: 'Failed to retrieve down payment invoice data',
+	successLabel: 'Down payment invoice details',
+});
 
 server.tool(
 	'get-profile',
@@ -1607,12 +1225,10 @@ server.tool(
 		const data = await makeLexwareOfficeRequest<any>('/v1/profile');
 
 		if (!data) {
-			return { content: [{ type: 'text', text: 'Failed to retrieve profile data' }] };
+			return textResponse('Failed to retrieve profile data');
 		}
 
-		return {
-			content: [{ type: 'text', text: `Company profile:\n\n${JSON.stringify(data, null, 2)}` }],
-		};
+		return textResponse(`Company profile:\n\n${JSON.stringify(data, null, 2)}`);
 	},
 );
 
@@ -1624,12 +1240,10 @@ server.tool(
 		const data = await makeLexwareOfficeRequest<any>('/v1/print-layouts');
 
 		if (!data) {
-			return { content: [{ type: 'text', text: 'Failed to retrieve print layouts' }] };
+			return textResponse('Failed to retrieve print layouts');
 		}
 
-		return {
-			content: [{ type: 'text', text: `Print layouts:\n\n${JSON.stringify(data, null, 2)}` }],
-		};
+		return textResponse(`Print layouts:\n\n${JSON.stringify(data, null, 2)}`);
 	},
 );
 
@@ -1644,12 +1258,10 @@ server.tool(
 		const data = await makeLexwareOfficeRequest<any>(`/v1/recurring-templates?page=${page}&size=${size}`);
 
 		if (!data) {
-			return { content: [{ type: 'text', text: 'Failed to retrieve recurring templates' }] };
+			return textResponse('Failed to retrieve recurring templates');
 		}
 
-		return {
-			content: [{ type: 'text', text: `Recurring templates:\n\n${JSON.stringify(data, null, 2)}` }],
-		};
+		return textResponse(`Recurring templates:\n\n${JSON.stringify(data, null, 2)}`);
 	},
 );
 
@@ -1672,78 +1284,37 @@ server.tool(
 		const data = await makeLexwareOfficeRequest<any>(`/v1/articles?${params.toString()}`);
 
 		if (!data) {
-			return { content: [{ type: 'text', text: 'Failed to retrieve articles' }] };
+			return textResponse('Failed to retrieve articles');
 		}
 
-		return {
-			content: [{ type: 'text', text: `Articles:\n\n${JSON.stringify(data, null, 2)}` }],
-		};
+		return textResponse(`Articles:\n\n${JSON.stringify(data, null, 2)}`);
 	},
 );
 
-server.tool(
-	'get-article-details',
-	'Get details of an article (Artikel/Produkt) from Lexware Office by its ID',
-	{
-		id: z.string().uuid().describe('The ID of the article'),
-	},
-	async ({ id }) => {
-		const data = await makeLexwareOfficeRequest<any>(`/v1/articles/${id}`);
-
-		if (!data) {
-			return { content: [{ type: 'text', text: 'Failed to retrieve article data' }] };
-		}
-
-		return {
-			content: [{ type: 'text', text: `Article details:\n\n${JSON.stringify(data, null, 2)}` }],
-		};
-	},
-);
+registerDetailTool({
+	name: 'get-article-details',
+	description: 'Get details of an article (Artikel/Produkt) from Lexware Office by its ID',
+	path: '/v1/articles',
+	idDescription: 'The ID of the article',
+	failText: 'Failed to retrieve article data',
+	successLabel: 'Article details',
+});
 
 const quotationSchema = {
 	...invoiceSchema,
 	expirationDate: z.string().optional().describe('Expiration date of the quotation in ISO 8601 format, e.g. "2026-05-22T00:00:00.000+01:00"'),
 };
 
-async function handleQuotationRequest(
-	params: Record<string, unknown>,
-	finalize: boolean,
-): Promise<{ content: Array<{ type: 'text'; text: string }> }> {
-	const path = finalize ? '/v1/quotations?finalize=true' : '/v1/quotations';
-	const body = {
-		...params,
-		totalPrice: { currency: 'EUR' },
-	};
-	const result = await makeLexwareOfficeWriteRequest<any>(path, 'POST', body);
-
-	if (!result || !result.ok) {
-		return { content: [{ type: 'text', text: writeErrorResponse(result && !result.ok ? result : null) }] };
-	}
-
-	const action = finalize ? 'created and finalized' : 'created as draft';
-	return {
-		content: [
-			{
-				type: 'text',
-				text: `Quotation ${action} successfully:\n\n${JSON.stringify(result.data, null, 2)}`,
-			},
-		],
-	};
-}
-
-server.tool(
-	'create-quotation',
-	'Create a new quotation (Angebot) as a draft in Lexware Office. The quotation will not be sent to the customer. Use finalize-quotation to create and immediately finalize.',
-	quotationSchema,
-	async (params) => handleQuotationRequest(params, false),
-);
-
-server.tool(
-	'finalize-quotation',
-	'Create and immediately finalize (publish) a quotation (Angebot) in Lexware Office. The quotation will be locked and cannot be edited. Use create-quotation to create a draft first.',
-	quotationSchema,
-	async (params) => handleQuotationRequest(params, true),
-);
+registerSalesDocumentTools({
+	noun: 'Quotation',
+	slug: 'quotation',
+	path: '/v1/quotations',
+	schema: quotationSchema,
+	createDescription:
+		'Create a new quotation (Angebot) as a draft in Lexware Office. The quotation will not be sent to the customer. Use finalize-quotation to create and immediately finalize.',
+	finalizeDescription:
+		'Create and immediately finalize (publish) a quotation (Angebot) in Lexware Office. The quotation will be locked and cannot be edited. Use create-quotation to create a draft first.',
+});
 
 const creditNoteSchema = {
 	...invoiceSchema,
@@ -1754,85 +1325,27 @@ const creditNoteSchema = {
 		.describe('ID of the original invoice this credit note refers to (optional)'),
 };
 
-async function handleCreditNoteRequest(
-	params: Record<string, unknown>,
-	finalize: boolean,
-): Promise<{ content: Array<{ type: 'text'; text: string }> }> {
-	const path = finalize ? '/v1/credit-notes?finalize=true' : '/v1/credit-notes';
-	const body = {
-		...params,
-		totalPrice: { currency: 'EUR' },
-	};
-	const result = await makeLexwareOfficeWriteRequest<any>(path, 'POST', body);
+registerSalesDocumentTools({
+	noun: 'Credit note',
+	slug: 'credit-note',
+	path: '/v1/credit-notes',
+	schema: creditNoteSchema,
+	createDescription:
+		'Create a new credit note (Gutschrift) as a draft in Lexware Office. Use finalize-credit-note to create and immediately finalize.',
+	finalizeDescription:
+		'Create and immediately finalize a credit note (Gutschrift) in Lexware Office. The credit note will be locked and cannot be edited.',
+});
 
-	if (!result || !result.ok) {
-		return { content: [{ type: 'text', text: writeErrorResponse(result && !result.ok ? result : null) }] };
-	}
-
-	const action = finalize ? 'created and finalized' : 'created as draft';
-	return {
-		content: [
-			{
-				type: 'text',
-				text: `Credit note ${action} successfully:\n\n${JSON.stringify(result.data, null, 2)}`,
-			},
-		],
-	};
-}
-
-server.tool(
-	'create-credit-note',
-	'Create a new credit note (Gutschrift) as a draft in Lexware Office. Use finalize-credit-note to create and immediately finalize.',
-	creditNoteSchema,
-	async (params) => handleCreditNoteRequest(params, false),
-);
-
-server.tool(
-	'finalize-credit-note',
-	'Create and immediately finalize a credit note (Gutschrift) in Lexware Office. The credit note will be locked and cannot be edited.',
-	creditNoteSchema,
-	async (params) => handleCreditNoteRequest(params, true),
-);
-
-async function handleOrderConfirmationRequest(
-	params: Record<string, unknown>,
-	finalize: boolean,
-): Promise<{ content: Array<{ type: 'text'; text: string }> }> {
-	const path = finalize ? '/v1/order-confirmations?finalize=true' : '/v1/order-confirmations';
-	const body = {
-		...params,
-		totalPrice: { currency: 'EUR' },
-	};
-	const result = await makeLexwareOfficeWriteRequest<any>(path, 'POST', body);
-
-	if (!result || !result.ok) {
-		return { content: [{ type: 'text', text: writeErrorResponse(result && !result.ok ? result : null) }] };
-	}
-
-	const action = finalize ? 'created and finalized' : 'created as draft';
-	return {
-		content: [
-			{
-				type: 'text',
-				text: `Order confirmation ${action} successfully:\n\n${JSON.stringify(result.data, null, 2)}`,
-			},
-		],
-	};
-}
-
-server.tool(
-	'create-order-confirmation',
-	'Create a new order confirmation (Auftragsbestätigung) as a draft in Lexware Office. Use finalize-order-confirmation to create and immediately finalize.',
-	invoiceSchema,
-	async (params) => handleOrderConfirmationRequest(params, false),
-);
-
-server.tool(
-	'finalize-order-confirmation',
-	'Create and immediately finalize an order confirmation (Auftragsbestätigung) in Lexware Office. The document will be locked and cannot be edited.',
-	invoiceSchema,
-	async (params) => handleOrderConfirmationRequest(params, true),
-);
+registerSalesDocumentTools({
+	noun: 'Order confirmation',
+	slug: 'order-confirmation',
+	path: '/v1/order-confirmations',
+	schema: invoiceSchema,
+	createDescription:
+		'Create a new order confirmation (Auftragsbestätigung) as a draft in Lexware Office. Use finalize-order-confirmation to create and immediately finalize.',
+	finalizeDescription:
+		'Create and immediately finalize an order confirmation (Auftragsbestätigung) in Lexware Office. The document will be locked and cannot be edited.',
+});
 
 const deliveryNoteLineItemSchema = z.discriminatedUnion('type', [
 	z.object({
@@ -1884,41 +1397,17 @@ const deliveryNoteSchema = {
 	remark: z.string().optional().describe('Closing text after line items'),
 };
 
-async function handleDeliveryNoteRequest(
-	params: Record<string, unknown>,
-	finalize: boolean,
-): Promise<{ content: Array<{ type: 'text'; text: string }> }> {
-	const path = finalize ? '/v1/delivery-notes?finalize=true' : '/v1/delivery-notes';
-	const result = await makeLexwareOfficeWriteRequest<any>(path, 'POST', params);
-
-	if (!result || !result.ok) {
-		return { content: [{ type: 'text', text: writeErrorResponse(result && !result.ok ? result : null) }] };
-	}
-
-	const action = finalize ? 'created and finalized' : 'created as draft';
-	return {
-		content: [
-			{
-				type: 'text',
-				text: `Delivery note ${action} successfully:\n\n${JSON.stringify(result.data, null, 2)}`,
-			},
-		],
-	};
-}
-
-server.tool(
-	'create-delivery-note',
-	'Create a new delivery note (Lieferschein) as a draft in Lexware Office. Delivery notes are logistics documents without pricing. Use finalize-delivery-note to create and immediately finalize.',
-	deliveryNoteSchema,
-	async (params) => handleDeliveryNoteRequest(params, false),
-);
-
-server.tool(
-	'finalize-delivery-note',
-	'Create and immediately finalize a delivery note (Lieferschein) in Lexware Office. The document will be locked and cannot be edited.',
-	deliveryNoteSchema,
-	async (params) => handleDeliveryNoteRequest(params, true),
-);
+registerSalesDocumentTools({
+	noun: 'Delivery note',
+	slug: 'delivery-note',
+	path: '/v1/delivery-notes',
+	schema: deliveryNoteSchema,
+	includeTotalPrice: false,
+	createDescription:
+		'Create a new delivery note (Lieferschein) as a draft in Lexware Office. Delivery notes are logistics documents without pricing. Use finalize-delivery-note to create and immediately finalize.',
+	finalizeDescription:
+		'Create and immediately finalize a delivery note (Lieferschein) in Lexware Office. The document will be locked and cannot be edited.',
+});
 
 const articlePriceSchema = z.object({
 	leadingPrice: z.enum(['NET', 'GROSS']).describe('"NET" to specify net price, "GROSS" to specify gross price'),
@@ -1947,18 +1436,7 @@ server.tool(
 
 		const result = await makeLexwareOfficeWriteRequest<any>('/v1/articles', 'POST', body);
 
-		if (!result || !result.ok) {
-			return { content: [{ type: 'text', text: writeErrorResponse(result && !result.ok ? result : null) }] };
-		}
-
-		return {
-			content: [
-				{
-					type: 'text',
-					text: `Article created successfully:\n\n${JSON.stringify(result.data, null, 2)}`,
-				},
-			],
-		};
+		return writeResultResponse(result, (data) => `Article created successfully:\n\n${JSON.stringify(data, null, 2)}`);
 	},
 );
 
@@ -1984,18 +1462,7 @@ server.tool(
 
 		const result = await makeLexwareOfficeWriteRequest<any>(`/v1/articles/${id}`, 'PUT', body);
 
-		if (!result || !result.ok) {
-			return { content: [{ type: 'text', text: writeErrorResponse(result && !result.ok ? result : null) }] };
-		}
-
-		return {
-			content: [
-				{
-					type: 'text',
-					text: `Article updated successfully:\n\n${JSON.stringify(result.data, null, 2)}`,
-				},
-			],
-		};
+		return writeResultResponse(result, (data) => `Article updated successfully:\n\n${JSON.stringify(data, null, 2)}`);
 	},
 );
 
@@ -2008,13 +1475,7 @@ server.tool(
 	async ({ id }) => {
 		const result = await makeLexwareOfficeWriteRequest<any>(`/v1/articles/${id}`, 'DELETE');
 
-		if (!result || !result.ok) {
-			return { content: [{ type: 'text', text: writeErrorResponse(result && !result.ok ? result : null) }] };
-		}
-
-		return {
-			content: [{ type: 'text', text: `Article ${id} deleted successfully.` }],
-		};
+		return writeResultResponse(result, () => `Article ${id} deleted successfully.`);
 	},
 );
 
@@ -2041,33 +1502,21 @@ server.tool(
 		const data = await makeLexwareOfficeRequest<any>('/v1/event-subscriptions');
 
 		if (!data) {
-			return { content: [{ type: 'text', text: 'Failed to retrieve event subscriptions' }] };
+			return textResponse('Failed to retrieve event subscriptions');
 		}
 
-		return {
-			content: [{ type: 'text', text: `Event subscriptions:\n\n${JSON.stringify(data, null, 2)}` }],
-		};
+		return textResponse(`Event subscriptions:\n\n${JSON.stringify(data, null, 2)}`);
 	},
 );
 
-server.tool(
-	'get-event-subscription',
-	'Retrieve a specific webhook event subscription from Lexware Office by its ID.',
-	{
-		id: z.string().uuid().describe('The ID of the event subscription'),
-	},
-	async ({ id }) => {
-		const data = await makeLexwareOfficeRequest<any>(`/v1/event-subscriptions/${id}`);
-
-		if (!data) {
-			return { content: [{ type: 'text', text: 'Failed to retrieve event subscription' }] };
-		}
-
-		return {
-			content: [{ type: 'text', text: `Event subscription:\n\n${JSON.stringify(data, null, 2)}` }],
-		};
-	},
-);
+registerDetailTool({
+	name: 'get-event-subscription',
+	description: 'Retrieve a specific webhook event subscription from Lexware Office by its ID.',
+	path: '/v1/event-subscriptions',
+	idDescription: 'The ID of the event subscription',
+	failText: 'Failed to retrieve event subscription',
+	successLabel: 'Event subscription',
+});
 
 server.tool(
 	'create-event-subscription',
@@ -2082,13 +1531,7 @@ server.tool(
 			callbackUrl,
 		});
 
-		if (!result || !result.ok) {
-			return { content: [{ type: 'text', text: writeErrorResponse(result && !result.ok ? result : null) }] };
-		}
-
-		return {
-			content: [{ type: 'text', text: `Event subscription created successfully:\n\n${JSON.stringify(result.data, null, 2)}` }],
-		};
+		return writeResultResponse(result, (data) => `Event subscription created successfully:\n\n${JSON.stringify(data, null, 2)}`);
 	},
 );
 
@@ -2101,13 +1544,7 @@ server.tool(
 	async ({ id }) => {
 		const result = await makeLexwareOfficeWriteRequest<void>(`/v1/event-subscriptions/${id}`, 'DELETE');
 
-		if (!result || !result.ok) {
-			return { content: [{ type: 'text', text: writeErrorResponse(result && !result.ok ? result : null) }] };
-		}
-
-		return {
-			content: [{ type: 'text', text: `Event subscription ${id} deleted successfully.` }],
-		};
+		return writeResultResponse(result, () => `Event subscription ${id} deleted successfully.`);
 	},
 );
 
@@ -2141,13 +1578,7 @@ server.tool(
 
 		const result = await makeLexwareOfficeMultipartRequest<any>('/v1/files', formData);
 
-		if (!result || !result.ok) {
-			return { content: [{ type: 'text', text: writeErrorResponse(result && !result.ok ? result : null) }] };
-		}
-
-		return {
-			content: [{ type: 'text', text: `File uploaded successfully:\n\n${JSON.stringify(result.data, null, 2)}` }],
-		};
+		return writeResultResponse(result, (data) => `File uploaded successfully:\n\n${JSON.stringify(data, null, 2)}`);
 	},
 );
 
@@ -2167,13 +1598,7 @@ server.tool(
 
 		const result = await makeLexwareOfficeMultipartRequest<any>(`/v1/vouchers/${voucherId}/files`, formData);
 
-		if (!result || !result.ok) {
-			return { content: [{ type: 'text', text: writeErrorResponse(result && !result.ok ? result : null) }] };
-		}
-
-		return {
-			content: [{ type: 'text', text: `File uploaded to voucher ${voucherId} successfully:\n\n${JSON.stringify(result.data, null, 2)}` }],
-		};
+		return writeResultResponse(result, (data) => `File uploaded to voucher ${voucherId} successfully:\n\n${JSON.stringify(data, null, 2)}`);
 	},
 );
 
