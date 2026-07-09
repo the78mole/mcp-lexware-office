@@ -10,6 +10,8 @@ export interface LexwareApiCatalog {
 		financeReportingSemantics: LexwareFinanceReportingSemantics;
 		domainIndex: Record<string, { summary: string; tags: string[]; endpoints: Array<{ method: string; path: string }> }>;
 		notes: string[];
+		// Injected at runtime by the MCP server: whether POST/PUT/PATCH/DELETE are currently allowed.
+		writesEnabled?: boolean;
 	};
 	paths: Record<string, Partial<Record<HttpMethod, LexwareOperation>>>;
 	workflows: Record<string, LexwareWorkflow>;
@@ -434,6 +436,8 @@ export const lexwareSpec: LexwareApiCatalog = {
 			'Voucherlist status semantics and reporting defaults live in spec.info.voucherStatusSemantics. Use them before choosing voucherStatus for finance/reporting workflows.',
 			'Finance/reporting caveats and examples live in spec.info.financeReportingSemantics. Use them before answering ambiguous earnings/revenue/Umsatz/profit questions.',
 			'Updates use optimistic locking via a version field; on HTTP 409, re-fetch the resource and retry with the current version.',
+			'spec.info.writesEnabled reports whether this server currently allows POST/PUT/PATCH/DELETE; check it before planning writes or uploads.',
+			'File uploads go through the multipart request field of lexware.request (contentPath for local files, contentBase64 for base64 bytes) — see the fileHandling workflow.',
 		],
 	},
 	paths: {
@@ -701,13 +705,13 @@ export const lexwareSpec: LexwareApiCatalog = {
 			put: { operationId: 'updateVoucher', tags: ['vouchers', 'bookkeeping', 'write'], summary: 'Update a bookkeeping voucher', parameters: [idParam('Voucher UUID')], requestBody: { contentType: 'application/json', summary: 'Full voucher JSON including current version for optimistic locking.', required: ['version', 'type', 'voucherDate', 'totalGrossAmount', 'totalTaxAmount', 'taxType', 'voucherItems'] }, responses: documentResponses, notes: ['On 409 conflict, re-fetch the voucher and retry with its current version.'], docsUrl: 'https://developers.lexware.io/docs/#vouchers-endpoint-update-a-voucher' },
 		},
 		'/v1/vouchers/{id}/files': {
-			post: { operationId: 'uploadFileToVoucher', tags: ['vouchers', 'files', 'bookkeeping', 'write'], summary: 'Upload and attach a file to a voucher', parameters: [idParam('Voucher UUID')], requestBody: { contentType: 'multipart/form-data', summary: 'Multipart file upload. Field: file.' }, responses: documentResponses, docsUrl: 'https://developers.lexware.io/docs/#vouchers-endpoint-upload-a-file-to-a-voucher' },
+			post: { operationId: 'uploadFileToVoucher', tags: ['vouchers', 'files', 'bookkeeping', 'write', 'upload'], summary: 'Upload and attach a file to a voucher', parameters: [idParam('Voucher UUID')], requestBody: { contentType: 'multipart/form-data', summary: 'Multipart file upload. Field: file.' }, responses: documentResponses, notes: ['Upload via the multipart request field of lexware.request, e.g. multipart: [{ name: "file", contentType: "application/pdf", contentPath: "/absolute/path/doc.pdf" }]. Use contentPath for files on the server machine, contentBase64 for bytes held as base64.'], examples: [{ multipart: [{ name: 'file', contentType: 'application/pdf', contentPath: '/absolute/path/to/receipt.pdf' }] }], docsUrl: 'https://developers.lexware.io/docs/#vouchers-endpoint-upload-a-file-to-a-voucher' },
 		},
 		'/v1/posting-categories': {
 			get: { operationId: 'listPostingCategories', tags: ['posting-categories', 'bookkeeping', 'reference-data', 'read'], summary: 'List bookkeeping posting categories', responses: documentResponses, notes: ['Use returned category ids when creating/updating bookkeeping vouchers.'], docsUrl: 'https://developers.lexware.io/docs/#posting-categories-endpoint' },
 		},
 		'/v1/files': {
-			post: { operationId: 'uploadFile', tags: ['files', 'documents', 'write'], summary: 'Upload a file', requestBody: { contentType: 'multipart/form-data', summary: 'Multipart upload. Form fields: file (the binary file) and type (e.g. voucher). Both are multipart form fields, not query parameters.', required: ['file', 'type'], shape: { file: 'binary file content', type: 'voucher' } }, responses: documentResponses, notes: ['type=voucher is a multipart form field, not a query parameter. Send both file and type as form fields.'], docsUrl: 'https://developers.lexware.io/docs/#files-endpoint-upload-a-file' },
+			post: { operationId: 'uploadFile', tags: ['files', 'documents', 'write', 'upload', 'beleg'], summary: 'Upload a file', requestBody: { contentType: 'multipart/form-data', summary: 'Multipart upload. Form fields: file (the binary file) and type (e.g. voucher). Both are multipart form fields, not query parameters.', required: ['file', 'type'], shape: { file: 'binary file content', type: 'voucher' } }, responses: documentResponses, notes: ['type=voucher is a multipart form field, not a query parameter. Send both file and type as form fields.', 'Upload via the multipart request field of lexware.request — never hand-roll boundaries or inline file bytes in code. For a file on the server machine use contentPath (absolute path; host reads it from disk). For bytes you already hold as base64 use contentBase64.', 'The response includes sent: { bytes, parts: [{ name, filename, bytes, sha256 }] } echoing the uploaded binary payload for integrity checks.'], examples: [{ multipart: [{ name: 'file', contentType: 'application/pdf', contentPath: '/absolute/path/to/receipt.pdf' }, { name: 'type', value: 'voucher' }] }], docsUrl: 'https://developers.lexware.io/docs/#files-endpoint-upload-a-file' },
 		},
 		'/v1/files/{id}': {
 			get: { operationId: 'downloadFile', tags: ['files', 'documents', 'read'], summary: 'Download a file by file id', parameters: [idParam('File UUID')], responses: { '200': 'Binary/PDF/XML file content', '404': 'File not found' }, notes: ['Accept can be application/pdf, application/xml, or */*. Return as resource/blob, not as large inline text.'], docsUrl: 'https://developers.lexware.io/docs/#files-endpoint-retrieve-a-file' },
@@ -887,10 +891,15 @@ export const lexwareSpec: LexwareApiCatalog = {
 			notes: ['PUT requests generally replace list-valued fields; avoid dropping data by including existing list values unless intentionally removing them.'],
 		},
 		fileHandling: {
-			summary: 'Upload and download files/documents',
+			summary: 'Upload and download files/documents (Belege)',
+			keywords: ['upload', 'beleg', 'receipt', 'pdf', 'multipart', 'contentPath', 'file'],
 			steps: [
-				'For bookkeeping file upload, POST multipart/form-data to /v1/files with type=voucher.',
-				'To attach a file directly to a voucher, POST multipart/form-data to /v1/vouchers/{id}/files.',
+				'Check spec.info.writesEnabled first — uploads are writes and are blocked when it is false.',
+				'For bookkeeping file upload, POST to /v1/files using the multipart request field with parts file and type=voucher (see example).',
+				'For a file on the server machine, set contentPath to its absolute path — the host reads the file from disk, so never inline file bytes or base64 in the code string.',
+				'For bytes you already hold as base64, use contentBase64 instead of contentPath.',
+				'Verify the upload via response.sent (bytes and sha256 per binary part) and the returned file id.',
+				'To attach a file directly to a voucher, POST the same multipart shape (file part only) to /v1/vouchers/{id}/files.',
 				'To download a known file, GET /v1/files/{id} with an appropriate Accept header.',
 				'To download a sales document PDF, GET /v1/{documentType}/{id}/file after the document is finalized/rendered.',
 			],
@@ -900,7 +909,23 @@ export const lexwareSpec: LexwareApiCatalog = {
 				{ method: 'POST', path: '/v1/vouchers/{id}/files' },
 				{ method: 'GET', path: '/v1/invoices/{id}/file' },
 			],
-			notes: ['Binary/PDF/XML data should be returned as an MCP resource/blob or compact metadata, not pasted as huge text.'],
+			notes: [
+				'Binary/PDF/XML data should be returned as an MCP resource/blob or compact metadata, not pasted as huge text.',
+				'Do not use body/rawBody for multipart endpoints — string bodies are UTF-8 encoded and corrupt binary data. The multipart field is the binary-safe path.',
+			],
+			examples: [
+				{
+					description: 'Upload a local PDF as a bookkeeping voucher (Beleg)',
+					request: {
+						method: 'POST',
+						path: '/v1/files',
+						multipart: [
+							{ name: 'file', contentType: 'application/pdf', contentPath: '/absolute/path/to/receipt.pdf' },
+							{ name: 'type', value: 'voucher' },
+						],
+					},
+				},
+			],
 		},
 		findContact: {
 			summary: 'Find a contact by email/name/number/role',

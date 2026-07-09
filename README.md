@@ -66,19 +66,22 @@ The sandbox does **not** receive the Lexware API key, Node globals, filesystem a
 
 #### Binary-safe file uploads
 
-v2 supports binary-safe uploads via `bodyBase64` (raw binary body) and `multipart` with `contentBase64` (binary FormData parts). The host decodes base64 and builds `Buffer` / `Blob` bodies outside the QuickJS sandbox:
+v2 supports binary-safe uploads via `multipart` parts with `contentPath` (host reads a local file from disk), `contentBase64` (binary FormData parts), or `bodyBase64` (raw binary body). The host reads/decodes and builds `Buffer` / `Blob` bodies outside the QuickJS sandbox.
+
+Preferred: `contentPath` — pass the file's absolute path instead of inlining bytes. Requires `LEXWARE_OFFICE_ALLOW_WRITES=true` (uploads are writes) and works only when the MCP server runs on the machine that has the file:
 
 ```js
 async () => {
-  const pdfBytes = 'JVBERi0x...'; // base64-encoded PDF
-  return await lexware.request({
+  const response = await lexware.request({
     method: 'POST',
     path: '/v1/files',
     multipart: [
-      { name: 'file', filename: 'receipt.pdf', contentType: 'application/pdf', contentBase64: pdfBytes },
+      { name: 'file', contentType: 'application/pdf', contentPath: '/absolute/path/to/receipt.pdf' },
       { name: 'type', value: 'voucher' },
     ],
   });
+  // response.sent echoes { bytes, parts: [{ name, filename, bytes, sha256 }] } for integrity checks
+  return { id: response.data?.id, sent: response.sent };
 }
 ```
 

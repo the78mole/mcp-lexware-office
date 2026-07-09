@@ -1,3 +1,7 @@
+import { createHash } from 'node:crypto';
+import { readFile, stat } from 'node:fs/promises';
+import { basename, isAbsolute } from 'node:path';
+
 import { lexwareSpec, type HttpMethod, type LexwareOperation } from './lexware-spec.js';
 import { truncateText } from './truncate.js';
 import { VERSION } from '../version.js';
@@ -13,6 +17,7 @@ export interface MultipartPart {
 	filename?: string;
 	contentType?: string;
 	contentBase64?: string;
+	contentPath?: string;
 }
 
 export interface LexwareRequestInput {
@@ -61,6 +66,13 @@ export interface LexwareResponse {
 	data?: unknown;
 	text?: string;
 	truncated?: boolean;
+	sent?: UploadEcho;
+}
+
+export interface UploadEcho {
+	bytes: number;
+	sha256?: string;
+	parts?: Array<{ name: string; filename?: string; bytes: number; sha256: string }>;
 }
 
 interface MatchedOperation {
@@ -134,7 +146,7 @@ export class LexwareApiClient {
 				Authorization: `Bearer ${apiKey}`,
 			};
 
-			const body = serializeRequestBody(normalized, headers);
+			const { body, sent } = await serializeRequestBody(normalized, headers);
 
 			let response: Response;
 			try {
@@ -151,7 +163,8 @@ export class LexwareApiClient {
 				throw new Error(`Lexware API network error for ${normalized.method} ${normalized.path}: ${sanitizeFetchErrorMessage(error, apiKey)}`);
 			}
 
-			return await parseResponse(response, normalized, this.maxResponseChars);
+			const parsed = await parseResponse(response, normalized, this.maxResponseChars);
+			return sent !== undefined ? { ...parsed, sent } : parsed;
 		} finally {
 			clearTimeout(timeout);
 		}
@@ -201,7 +214,7 @@ function normalizeRequest(input: unknown): NormalizedRequest {
 	}
 
 	if (rawBody && request.body !== undefined && typeof request.body !== 'string') {
-		throw new Error('rawBody=true requires body to be a string. Encode binary/multipart payloads as a string with an explicit contentType boundary.');
+		throw new Error('rawBody=true requires body to be a string, and strings are UTF-8 encoded on the wire (not binary-safe). For file uploads use multipart: [{ name, filename, contentType, contentPath | contentBase64 }, ...] or bodyBase64 instead.');
 	}
 
 	// Mutual exclusion: bodyBase64, multipart, and body/rawBody are distinct modes.
@@ -216,6 +229,18 @@ function normalizeRequest(input: unknown): NormalizedRequest {
 
 	const bodyBase64 = request.bodyBase64 === undefined ? undefined : normalizeBase64Field(request.bodyBase64, 'bodyBase64');
 	const multipart = request.multipart === undefined ? undefined : normalizeMultipart(request.multipart);
+
+	// Fail fast on multipart endpoints instead of letting the Lexware API return an opaque 500:
+	// body/bodyBase64 only make sense there when the caller hand-rolls the multipart encoding
+	// and says so via an explicit multipart/* contentType with boundary.
+	if (
+		matched?.operation.requestBody?.contentType === 'multipart/form-data'
+		&& multipart === undefined
+		&& (request.body !== undefined || bodyBase64 !== undefined)
+		&& !(contentType?.toLowerCase().includes('multipart/'))
+	) {
+		throw new Error(`${method} ${url.pathname} expects multipart/form-data. Use the multipart request field, e.g. multipart: [{ name: 'file', filename: 'doc.pdf', contentType: 'application/pdf', contentPath: '/absolute/path/doc.pdf' }, { name: 'type', value: 'voucher' }]. body/bodyBase64 are only allowed here with an explicit contentType containing 'multipart/' and a boundary.`);
+	}
 
 	const query = new URLSearchParams(url.search);
 	appendQueryObject(query, request.query);
@@ -294,11 +319,17 @@ function normalizeMultipart(parts: unknown): MultipartPart[] {
 		if (p.contentBase64 !== undefined) {
 			normalizeBase64Field(p.contentBase64, `multipart[${index}].contentBase64`);
 		}
-		if (p.value === undefined && p.contentBase64 === undefined) {
-			throw new Error(`multipart[${index}] must have either value or contentBase64`);
+		if (p.contentPath !== undefined) {
+			if (typeof p.contentPath !== 'string' || p.contentPath.trim().length === 0) {
+				throw new Error(`multipart[${index}].contentPath must be a non-empty string`);
+			}
+			if (!isAbsolute(p.contentPath)) {
+				throw new Error(`multipart[${index}].contentPath must be an absolute path on the MCP server machine`);
+			}
 		}
-		if (p.value !== undefined && p.contentBase64 !== undefined) {
-			throw new Error(`multipart[${index}] must not have both value and contentBase64`);
+		const contentModes = [p.value !== undefined, p.contentBase64 !== undefined, p.contentPath !== undefined].filter(Boolean).length;
+		if (contentModes !== 1) {
+			throw new Error(`multipart[${index}] must have exactly one of value, contentBase64, or contentPath`);
 		}
 		return {
 			name: p.name as string,
@@ -306,6 +337,7 @@ function normalizeMultipart(parts: unknown): MultipartPart[] {
 			...(p.filename !== undefined && { filename: p.filename as string }),
 			...(p.contentType !== undefined && { contentType: p.contentType as string }),
 			...(p.contentBase64 !== undefined && { contentBase64: p.contentBase64 as string }),
+			...(p.contentPath !== undefined && { contentPath: p.contentPath as string }),
 		};
 	});
 }
@@ -352,45 +384,86 @@ function escapeRegex(value: string): string {
 	return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
-function serializeRequestBody(request: NormalizedRequest, headers: Record<string, string>): BodyInit | undefined {
+const MAX_UPLOAD_FILE_BYTES = 25 * 1024 * 1024;
+
+interface SerializedBody {
+	body: BodyInit | undefined;
+	sent?: UploadEcho;
+}
+
+async function serializeRequestBody(request: NormalizedRequest, headers: Record<string, string>): Promise<SerializedBody> {
 	// Binary body: decode base64 on the host, send raw bytes.
 	if (request.bodyBase64 !== undefined) {
 		headers['Content-Type'] = request.contentType ?? 'application/octet-stream';
-		return Buffer.from(request.bodyBase64, 'base64');
+		const buffer = Buffer.from(request.bodyBase64, 'base64');
+		return { body: buffer, sent: { bytes: buffer.length, sha256: sha256Hex(buffer) } };
 	}
 
 	// Multipart body: build FormData on the host with binary-safe parts.
 	if (request.multipart !== undefined) {
 		const formData = new FormData();
+		const sentParts: NonNullable<UploadEcho['parts']> = [];
 		for (const part of request.multipart) {
+			let buffer: Buffer<ArrayBuffer> | undefined;
+			let defaultFilename = part.name;
 			if (part.contentBase64 !== undefined) {
-				const buffer = Buffer.from(part.contentBase64, 'base64');
+				buffer = Buffer.from(part.contentBase64, 'base64');
+			} else if (part.contentPath !== undefined) {
+				buffer = await readUploadFile(part.contentPath);
+				defaultFilename = basename(part.contentPath);
+			}
+			if (buffer !== undefined) {
 				const blob = new Blob([buffer], { type: part.contentType ?? 'application/octet-stream' });
-				formData.append(part.name, blob, part.filename ?? part.name);
+				const filename = part.filename ?? defaultFilename;
+				formData.append(part.name, blob, filename);
+				sentParts.push({ name: part.name, filename, bytes: buffer.length, sha256: sha256Hex(buffer) });
 			} else {
 				formData.append(part.name, part.value ?? '');
 			}
 		}
 		// Do NOT set Content-Type manually; the Fetch API sets it with the correct boundary.
-		return formData;
+		const sent = sentParts.length > 0
+			? { bytes: sentParts.reduce((sum, part) => sum + part.bytes, 0), parts: sentParts }
+			: undefined;
+		return { body: formData, ...(sent !== undefined && { sent }) };
 	}
 
-	if (request.body === undefined) return undefined;
+	if (request.body === undefined) return { body: undefined };
 
 	if (request.rawBody) {
 		headers['Content-Type'] = request.contentType ?? 'application/octet-stream';
-		return request.body as string;
+		return { body: request.body as string };
 	}
 
 	const contentType = request.contentType ?? 'application/json';
 	headers['Content-Type'] = contentType;
 	if (isJsonContentType(contentType)) {
-		return JSON.stringify(request.body);
+		return { body: JSON.stringify(request.body) };
 	}
 	if (typeof request.body === 'string') {
-		return request.body;
+		return { body: request.body };
 	}
 	throw new Error('Non-JSON request bodies must be strings or use rawBody=true with an explicit contentType.');
+}
+
+async function readUploadFile(contentPath: string): Promise<Buffer<ArrayBuffer>> {
+	let stats;
+	try {
+		stats = await stat(contentPath);
+	} catch {
+		throw new Error(`multipart contentPath not found or not readable: ${contentPath}`);
+	}
+	if (!stats.isFile()) {
+		throw new Error(`multipart contentPath must be a regular file: ${contentPath}`);
+	}
+	if (stats.size > MAX_UPLOAD_FILE_BYTES) {
+		throw new Error(`multipart contentPath file is ${stats.size} bytes, exceeding the ${MAX_UPLOAD_FILE_BYTES} byte upload limit: ${contentPath}`);
+	}
+	return readFile(contentPath) as Promise<Buffer<ArrayBuffer>>;
+}
+
+function sha256Hex(buffer: Buffer): string {
+	return createHash('sha256').update(buffer).digest('hex');
 }
 
 function isJsonContentType(contentType: string): boolean {
@@ -511,6 +584,10 @@ function sanitizeFetchErrorMessage(error: unknown, apiKey: string): string {
 		.replaceAll(apiKey, '[redacted]')
 		.replace(/Bearer\s+[^\s]+/gi, 'Bearer [redacted]')
 		.replace(/https?:\/\/[^\s)]+/gi, '[url omitted]');
+}
+
+export function writesEnabled(): boolean {
+	return !writesAreGloballyDisabled();
 }
 
 function writesAreGloballyDisabled(): boolean {

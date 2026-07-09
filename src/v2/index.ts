@@ -4,7 +4,7 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { z } from 'zod';
 
 import { QuickJsExecutor } from './executor.js';
-import { LexwareApiClient } from './lexware-client.js';
+import { LexwareApiClient, writesEnabled } from './lexware-client.js';
 import { lexwareSpec } from './lexware-spec.js';
 import { stringifyForMcp } from './truncate.js';
 import { VERSION } from '../version.js';
@@ -20,6 +20,9 @@ const executeExecutor = new QuickJsExecutor();
 // slow Lexware requests fail with a clean error before the sandbox is torn down.
 const lexwareClient = new LexwareApiClient({ requestTimeoutMs: 25_000 });
 
+// Inject the current write mode so callers can branch before attempting a write.
+const sandboxSpec = () => ({ ...lexwareSpec, info: { ...lexwareSpec.info, writesEnabled: writesEnabled() } });
+
 server.tool(
 	'search',
 	`Search the curated Lexware Office API catalog by running a JavaScript async arrow function.
@@ -32,8 +35,9 @@ declare const spec: LexwareApiCatalog;
 
 Useful starting points:
 - spec.info.domainIndex: compact map from business domains to endpoint lists
+- spec.info.writesEnabled: whether this server currently allows POST/PUT/PATCH/DELETE — check before planning writes
 - spec.paths: path -> method -> operation catalog with params, requestBody, responses, examples, capabilities, docsUrl
-- spec.workflows: curated recipes for reporting, sales documents, files, webhooks, and API quirks
+- spec.workflows: curated recipes for reporting, sales documents, files/uploads, webhooks, and API quirks
 - spec.info.voucherStatusSemantics and financeReportingSemantics: finance/status guidance for revenue/Umsatz/profit questions
 
 Sandbox: no network, filesystem, process, fetch, imports, or API key. Return JSON-serializable data; console logs are captured.
@@ -54,7 +58,7 @@ async () => {
 	async ({ code }) => {
 		const execution = await searchExecutor.execute(
 			code,
-			{ spec: lexwareSpec },
+			{ spec: sandboxSpec() },
 			{ timeoutMs: 1_000, memoryLimitBytes: 32 * 1024 * 1024, maxStackSizeBytes: 1024 * 1024, filename: 'lexware-search.js' },
 		);
 
@@ -104,11 +108,24 @@ type LexwareRequest = {
   method?: 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE';
   path: string; // relative /v1/... only; no absolute URLs or // hosts
   query?: Record<string, string | number | boolean | Array<string | number | boolean> | null | undefined>;
-  body?: unknown; // JSON by default; string when rawBody=true
+  body?: unknown; // JSON by default; string when rawBody=true (UTF-8 encoded, NOT binary-safe)
+  bodyBase64?: string; // raw binary body as base64; the host decodes it outside the sandbox
+  multipart?: MultipartPart[]; // multipart/form-data uploads (e.g. POST /v1/files); host builds FormData
   contentType?: string;
   rawBody?: boolean;
   accept?: string;
 };
+// At most one of body, bodyBase64, or multipart per request.
+
+type MultipartPart = {
+  name: string;
+  value?: string; // plain text form field
+  contentBase64?: string; // binary part content as base64; host decodes it
+  contentPath?: string; // absolute file path on the MCP server machine; host reads the file directly — preferred for local files (no base64, no size blowup)
+  filename?: string; // defaults to the contentPath basename
+  contentType?: string;
+};
+// Exactly one of value, contentBase64, or contentPath per part.
 
 type LexwareResponse<T = unknown> = {
   ok: boolean;
@@ -123,17 +140,32 @@ type LexwareResponse<T = unknown> = {
   retryAfterSeconds?: number;
   operation?: { operationId: string; method: string; pathTemplate: string; summary: string };
   request: { method: string; path: string; query: Record<string, string[]> };
+  sent?: { bytes: number; sha256?: string; parts?: Array<{ name: string; filename?: string; bytes: number; sha256: string }> }; // echo of uploaded binary payloads for integrity checks
 };
 
 lexware.request returns all HTTP responses, including non-OK, as LexwareResponse. Check response.ok/status for recovery logic, or use lexware.json(...) / lexware.paginate(...) when you want non-OK or non-JSON responses to throw.
 
-v2 is read-only by default. POST, PUT, PATCH, and DELETE are blocked unless the server is started with LEXWARE_OFFICE_ALLOW_WRITES=true. Setting LEXWARE_OFFICE_READ_ONLY=true is a hard block that overrides ALLOW_WRITES.
+v2 is read-only by default. POST, PUT, PATCH, and DELETE are blocked unless the server is started with LEXWARE_OFFICE_ALLOW_WRITES=true. Setting LEXWARE_OFFICE_READ_ONLY=true is a hard block that overrides ALLOW_WRITES. Check spec.info.writesEnabled to branch before attempting a write.
 
 Example:
 
 async () => {
   const response = await lexware.request({ path: '/v1/contacts', query: { page: 0, size: 5 } });
   return { status: response.status, request: response.request, data: response.data };
+}
+
+File upload example (bookkeeping Beleg). Never inline file bytes in code — pass the file's absolute path via contentPath and the host reads it from disk:
+
+async () => {
+  const response = await lexware.request({
+    method: 'POST',
+    path: '/v1/files',
+    multipart: [
+      { name: 'file', contentType: 'application/pdf', contentPath: '/absolute/path/to/receipt.pdf' },
+      { name: 'type', value: 'voucher' },
+    ],
+  });
+  return { status: response.status, id: response.data?.id, sent: response.sent };
 }`,
 	{
 		code: z.string().describe('JavaScript async arrow function to execute a constrained Lexware API workflow'),
@@ -150,7 +182,7 @@ async () => {
 		let requestCount = 0;
 		const execution = await executeExecutor.execute(
 			code,
-			{ spec: lexwareSpec },
+			{ spec: sandboxSpec() },
 			{
 				timeoutMs: 30_000,
 				memoryLimitBytes: 32 * 1024 * 1024,

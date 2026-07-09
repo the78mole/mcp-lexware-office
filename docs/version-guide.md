@@ -179,61 +179,55 @@ declare const lexware: {
 
 ## Binary-safe file uploads in v2
 
-v2 supports two binary-safe upload modes in addition to the legacy `rawBody=true` string-based multipart.
+v2 supports three binary-safe upload modes in addition to the legacy `rawBody=true` string-based multipart. Prefer `multipart` with `contentPath` — the file's bytes never pass through the model or the sandbox.
 
-### `bodyBase64` — raw binary body
+### `multipart` with `contentPath` — host reads a local file (preferred)
 
-Send a raw binary request body by base64-encoding it and setting `bodyBase64`. The host decodes the base64 outside the QuickJS sandbox and sends the raw bytes:
-
-```js
-async () => {
-  // pdfBytes is a base64-encoded PDF string produced by the AI or fetched externally.
-  const pdfBytes = 'JVBERi0x...'; // base64-encoded PDF
-  const response = await lexware.request({
-    method: 'POST',
-    path: '/v1/files',
-    bodyBase64: pdfBytes,
-    contentType: 'application/pdf',
-  });
-  return response.data;
-}
-```
-
-`contentType` defaults to `application/octet-stream` if not specified.
-
-### `multipart` — binary-safe FormData
-
-For multipart uploads (e.g. `/v1/files`, `/v1/vouchers/{id}/files`), pass a `multipart` array. Each part can supply either a plain string `value` or a `contentBase64` for binary content. The host decodes base64 and builds `FormData` with `Blob` parts outside the sandbox:
+For multipart uploads (e.g. `/v1/files`, `/v1/vouchers/{id}/files`), pass the file's absolute path. The host reads the file from disk outside the QuickJS sandbox and builds `FormData` with `Blob` parts:
 
 ```js
 async () => {
-  const pdfBytes = 'JVBERi0x...'; // base64-encoded PDF
   const response = await lexware.request({
     method: 'POST',
     path: '/v1/files',
     multipart: [
-      {
-        name: 'file',
-        filename: 'receipt.pdf',
-        contentType: 'application/pdf',
-        contentBase64: pdfBytes,   // decoded to binary Blob by the host
-      },
+      { name: 'file', contentType: 'application/pdf', contentPath: '/absolute/path/to/receipt.pdf' },
       { name: 'type', value: 'voucher' },
     ],
   });
-  return response.data;
+  // response.sent echoes what was uploaded for integrity checks:
+  // { bytes, parts: [{ name, filename, bytes, sha256 }] }
+  return { id: response.data?.id, sent: response.sent };
 }
 ```
 
+- `contentPath` must be an absolute path to a regular file on the machine running the MCP server (25 MB cap).
+- `filename` defaults to the `contentPath` basename.
+- Uploads are writes: they require `LEXWARE_OFFICE_ALLOW_WRITES=true`. Check `spec.info.writesEnabled` to branch early.
+
+### `multipart` with `contentBase64` — binary FormData parts
+
+When the bytes are only available as base64 (e.g. fetched externally), use `contentBase64` instead of `contentPath`. The host decodes the base64 outside the sandbox:
+
+```js
+{ name: 'file', filename: 'receipt.pdf', contentType: 'application/pdf', contentBase64: 'JVBERi0x...' }
+```
+
+### `bodyBase64` — raw binary body
+
+Send a raw (non-multipart) binary request body by base64-encoding it and setting `bodyBase64`. The host decodes the base64 and sends the raw bytes. `contentType` defaults to `application/octet-stream`. Not usable on multipart endpoints like `/v1/files` — those reject non-multipart bodies before sending (see below).
+
 Key constraints:
 - `body`, `bodyBase64`, and `multipart` are mutually exclusive — set at most one per request.
-- `contentBase64` and `value` are mutually exclusive within a single multipart part.
+- `value`, `contentBase64`, and `contentPath` are mutually exclusive within a single multipart part — set exactly one.
 - GET requests may not include any body mode.
-- Invalid base64 is rejected before the request is sent.
+- Invalid base64 and unreadable `contentPath` files are rejected before the request is sent.
+- Endpoints cataloged as `multipart/form-data` reject `body`/`bodyBase64` up front (instead of an opaque Lexware 500) unless an explicit `contentType` containing `multipart/` and a boundary marks a deliberately hand-rolled body.
+- Requests with binary payloads echo `response.sent` (`bytes`, `sha256` per part) so callers can verify what was uploaded.
 
 ### Legacy `rawBody=true`
 
-The original `rawBody=true` mode is preserved for backward compatibility. It sends a string body verbatim and is adequate for text-based multipart (e.g. manually constructed ASCII boundaries). It is **not** binary-safe for arbitrary byte sequences — use `bodyBase64` or `multipart` with `contentBase64` for true binary payloads.
+The original `rawBody=true` mode is preserved for backward compatibility. It sends a string body verbatim (UTF-8 encoded) and is adequate for text-based multipart (e.g. manually constructed ASCII boundaries). It is **not** binary-safe for arbitrary byte sequences — use `multipart` with `contentPath`/`contentBase64` or `bodyBase64` for true binary payloads.
 
 ## Permission models
 
